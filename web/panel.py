@@ -383,6 +383,12 @@ async def _try_official_frontend(url: str, body: bytes, content: bytes, user: st
     return None
 
 
+def _looks_like_json(body: bytes) -> bool:
+    """上游错误页常常是 HTML/空体，前端 JSON.parse 会直接抛错，所以这里先探一下。"""
+    head = (body or b"").lstrip()[:1]
+    return head in (b"{", b"[")
+
+
 async def api_pd_proxy(request: web.Request) -> web.Response:
     """把镜像页面的本站 API 请求透传给 pd.qq.com（携带当前槽位的 Cookie）。
 
@@ -408,16 +414,35 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
     headers["Referer"] = "https://pd.qq.com/"
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
     body = await request.read()
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=30, follow_redirects=True) as client:
-            resp = await client.request(
-                request.method,
-                url,
-                headers=headers,
-                content=body if request.method not in ("GET", "HEAD") else None,
-            )
-    except httpx.HTTPError as e:
-        return web.json_response({"success": False, "message": f"上游请求失败: {e}"}, status=502)
+    # 上游偶发 5xx / 网络抖动：重试一次再放弃（腾讯网关抖一下很常见）
+    resp = None
+    last_error = ""
+    async with httpx.AsyncClient(verify=False, timeout=30, follow_redirects=True) as client:
+        for attempt in (1, 2):
+            try:
+                resp = await client.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    content=body if request.method not in ("GET", "HEAD") else None,
+                )
+            except httpx.HTTPError as e:
+                last_error = str(e)
+                resp = None
+            if resp is not None and resp.status_code < 500:
+                break
+            if attempt == 1:
+                await asyncio.sleep(0.4)
+    if resp is None:
+        return web.json_response({"success": False, "retcode": -1, "message": f"上游请求失败: {last_error}"}, status=502)
+    # 上游错误页通常不是 JSON；前端拿到会直接 JSON.parse 崩掉（Unexpected end of JSON input）。
+    # 网关类错误统一包成 JSON 信封，让页面按正常错误态处理。
+    _ct = resp.headers.get("content-type", "")
+    if resp.status_code >= 500 and not _ct.lower().startswith("application/json") and not _looks_like_json(resp.content):
+        return web.json_response(
+            {"retcode": -1, "message": f"上游暂时不可用（HTTP {resp.status_code}）", "success": False},
+            status=502,
+        )
     out_headers = {
         k: v
         for k, v in resp.headers.items()
@@ -582,21 +607,32 @@ async def _run_cli_json(args: List[str], user: str = "") -> Dict[str, Any]:
             success = payload.get("success", data.get("success") if isinstance(data, dict) else None)
             code = payload.get(
                 "retCode",
-                payload.get("ret_code", data.get("retCode", data.get("ret_code", "")) if isinstance(data, dict) else ""),
+                payload.get(
+                    "ret_code",
+                    payload.get(
+                        "retcode",
+                        data.get("retCode", data.get("ret_code", data.get("retcode", ""))) if isinstance(data, dict) else "",
+                    ),
+                ),
             )
             if isinstance(success, bool):
                 result["success"] = result["success"] and success
             if str(code).strip() not in ("", "0", "OK", "ok"):
                 result["success"] = False
             if not result["success"]:
-                result["message"] = str(
+                msg = str(
                     payload.get("message")
                     or payload.get("msg")
                     or payload.get("error")
                     or (data.get("message") if isinstance(data, dict) else "")
                     or (data.get("msg") if isinstance(data, dict) else "")
-                    or "操作未成功，请查看返回详情"
-                )
+                    or ""
+                ).strip()
+                # 没有明确 message 时，把 CLI 的原始输出尾巴带上（用户要求看原始报错）
+                if not msg or msg in ("操作未成功，请查看返回详情",):
+                    tail = " ".join((output or "").split())[-400:]
+                    msg = (msg + " " if msg else "") + ("原始返回：" + tail if tail else "操作未成功")
+                result["message"] = msg
     else:
         result["raw"] = output.strip()[-2000:]
         if not ok:

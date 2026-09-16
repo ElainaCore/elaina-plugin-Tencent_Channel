@@ -7,6 +7,21 @@
   // 命中 qq 域的浏览器请求一律改写成本地 404，不触达 qq.com
   var BLOCKED_PATH = TXPD_API + '/__blocked';
 
+  // 深路径（/g/<频道>/post/<帖子> 等）整页加载时，SSR 里那套探索页会先渲染，
+  // 等应用路由就位才换成目标页 —— 于是「点开帖子先闪一眼『为你推荐精选频道与内容』」。
+  // 这里在解析阶段就给 <html> 打标记，配合 CSS 第一帧就把它藏掉（回到探索页会自动解除）。
+  (function () {
+    try {
+      var p0 = window.location.pathname;
+      var base0 = '/api/ext/tencent-channel/panel/';
+      var tail0 = p0.indexOf(base0) === 0 ? p0.slice(base0.length) : p0.replace(/^\/+/, '');
+      tail0 = tail0.replace(/^\/+/, '').replace(/\/+$/, '');
+      if (tail0 && tail0 !== 'explore' && tail0.indexOf('index') !== 0) {
+        document.documentElement.className += ' txpd-deep-route';
+      }
+    } catch (e) { /* 忽略 */ }
+  })();
+
   // 嵌入模式（帖子详情浮层里的 iframe）：不参与会话路径恢复，只渲染正文
   var TXPD_EMBED = false;
   try {
@@ -505,6 +520,8 @@
     '.txpd-mg-qr img{width:168px;height:168px;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;background:#fff;}',
     '.txpd-mg-qr-tip{margin-top:8px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
     '.txpd-mg-textarea{width:100%;min-height:110px;box-sizing:border-box;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;padding:10px 12px;font-size:13px;font-family:inherit;line-height:1.6;resize:vertical;color:var(--text-primary,#222);background:var(--bg-middle-light,#fff);}',
+    // 深路径整页加载：探索页 SSR 先闪一下 → 直接藏掉
+    'html.txpd-deep-route #explorePage{display:none!important;}',
     // 主页导航固定为这五项：官方导航项一律纯样式隐藏（首帧即生效，之后不动 DOM），
     // 插件自己那五项带 data-txpd-nav，不受这条影响
     '.aside-group--nav .app-menu-list > .menu-item:not([data-txpd-nav]){display:none!important;}',
@@ -524,7 +541,8 @@
     '.txpd-sched-cron{font-size:12px;color:var(--text-link,#2b64f5);}',
     '.txpd-sched-meta{margin-top:4px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
     '.txpd-sched-body{margin-top:4px;font-size:13px;color:var(--text-primary,#333);line-height:1.6;word-break:break-word;}',
-    // ---------- 交互顺滑化：过渡/进入动画（尊重系统「减少动态效果」）----------
+    '.txpd-avatar-ph{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#5b8cff,#8a6cff);color:#fff;font-size:14px;font-weight:600;border-radius:50%;}',
+    // 交互顺滑化：过渡/进入动画（尊重系统「减少动态效果」）----------
     '.txpd-mg-btn,.txpd-join-btn,.txpd-cli-more,.app-menu-list .menu-item{transition:background-color .16s ease,opacity .16s ease,transform .12s ease,color .16s ease;}',
     '.txpd-mg-btn:active,.txpd-join-btn:active,.txpd-cli-more:active{transform:scale(.97);}',
     '.txpd-mg-card,.txpd-sched-item{transition:box-shadow .2s ease,border-color .2s ease;}',
@@ -1079,6 +1097,48 @@
   function currentGuildNumber() {
     return extractGuildNumber(window.location.pathname);
   }
+  // 退出频道（CLI: manage leave-guild）——高风险操作，先确认
+  function openLeaveGuild(anchor) {
+    var ctx = currentGuild();
+    if (!ctx.g || !ctx.id) { toast('未识别当前频道（可能还没加载完频道列表）'); return; }
+    var name = ctx.g.name || ctx.num || ctx.id;
+    var dlgP = openPopover(anchor, '退出频道');
+    dlgP.appendChild(el('div', { style: 'font-size:13px;color:#333;line-height:1.7;margin-bottom:10px;' },
+      '确定让插件账号（CLI）退出「' + name + '」吗？退出后将无法以该账号在该频道发帖、评论、管理。'));
+    var row = el('div', { style: 'display:flex;gap:8px;align-items:center;' });
+    var ok = primaryBtn('确认退出');
+    ok.style.background = '#e5484d';
+    var cancel = el('button', { type: 'button', style: 'border:1px solid rgba(219,220,224,.9);background:#fff;border-radius:100px;height:34px;padding:0 16px;font-size:13px;color:#666;cursor:pointer;font-family:inherit;' }, '取消');
+    var status = statusLine();
+    row.appendChild(ok);
+    row.appendChild(cancel);
+    dlgP.appendChild(row);
+    dlgP.appendChild(status);
+    cancel.addEventListener('click', function () { closePopover(); });
+    ok.addEventListener('click', function () {
+      ok.disabled = true;
+      status.style.color = '#888';
+      status.textContent = '正在退出…';
+      api('/cli', { method: 'POST', body: { action: 'leave-guild', params: { guild_id: ctx.id } } }).then(function (r) {
+        if (!r.success) throw new Error(r.message || '退出失败');
+        status.style.color = '#15a361';
+        status.textContent = '✓ 已退出「' + name + '」';
+        invalidateGuilds();
+        loadJoinedGuilds().then(function () {
+          try { queueUiSync(); } catch (e) { /* 忽略 */ }
+          if (typeof ensureJoinedSection === 'function') ensureJoinedSection();
+          setTimeout(ensureGuildMeta, 0);
+        }).catch(function () { });
+        toast('✓ 已退出频道「' + name + '」');
+        setTimeout(closePopover, 1200);
+      }).catch(function (e) {
+        status.style.color = '#e5484d';
+        status.textContent = String((e && e.message) || e).slice(0, 200);
+        ok.disabled = false;
+      });
+    });
+  }
+
   function openJoinFlow(guildNumber) {
     ensureMask();
     stopPoll();
@@ -1255,6 +1315,33 @@
     }
   }
 
+  // 官方侧栏里同一频道的头像地址（带官方参数，能正常加载）；找不到就返回空
+  function officialAvatarOf(g) {
+    var gid = String((g && g.guild_id) || '');
+    var name = String((g && g.name) || '').trim();
+    var groups = ['.aside-group--my-guild', '.aside-group--my-temp-guild'];
+    for (var gi = 0; gi < groups.length; gi++) {
+      var items = document.querySelectorAll(groups[gi] + ' .my-guild-item');
+      for (var i = 0; i < items.length; i++) {
+        var img = items[i].querySelector('img');
+        var src = img ? (img.getAttribute('src') || '') : '';
+        if (!src) continue;
+        if (gid && src.indexOf('/' + gid + '/') !== -1) return src;
+        var nameEl = items[i].querySelector('.item-name');
+        var n = nameEl ? (nameEl.textContent || '').trim() : '';
+        if (name && n && n === name) return src;
+      }
+    }
+    return '';
+  }
+
+  // 官方同款占位：昵称首字 + 主题色底
+  function avatarPlaceholder(text) {
+    var d = el('div', { 'class': 'item-avatar txpd-avatar-ph' });
+    d.textContent = String(text || '?').trim().charAt(0) || '?';
+    return d;
+  }
+
   function ensureJoinedSection() {
     var nav = document.querySelector('.aside-nav');
     if (!nav) return;
@@ -1309,14 +1396,22 @@
           'title': (g.name || '') + '（' + (g.role || '成员') + '），点击进入频道',
         });
         var av = el('div', { 'class': 'item-avatar-wrap' });
-        var img = el('img', {
-          'class': 'item-avatar',
-          'src': 'https://groupprohead.gtimg.cn/' + g.guild_id + '/100',
-          'alt': g.name || '',
-          'loading': 'lazy',
-        });
-        img.addEventListener('error', function () { img.style.visibility = 'hidden'; });
-        av.appendChild(img);
+        // 头像地址优先取官方同频道的（带它们的鉴权参数）；自己拼的 gtimg 直链会 403/协议错误，
+        // 控制台还会把失败记在插件头上，所以拿不到就干脆不发请求，用官方同款占位。
+        var avUrl = officialAvatarOf(g);
+        if (avUrl) {
+          var img = el('img', {
+            'class': 'item-avatar',
+            'src': avUrl,
+            'alt': g.name || '',
+            'loading': 'lazy',
+            'referrerpolicy': 'no-referrer',
+          });
+          img.addEventListener('error', function () { img.style.display = 'none'; });
+          av.appendChild(img);
+        } else {
+          av.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
+        }
         item.appendChild(av);
         item.appendChild(el('div', { 'class': 'item-name ellipsis' }, g.name || g.guild_number || ''));
         item.addEventListener('click', function () { openGuildView(g); });
@@ -1738,10 +1833,12 @@
     _pageOpen = key;
     _pagePath = routeKey();
     ensurePageView();
+    try { markNavActive(); } catch (e) { /* 忽略 */ }
   }
   function closePage() {
     _pageOpen = '';
     ensurePageView();
+    try { markNavActive(); } catch (e) { /* 忽略 */ }
   }
   function openManagePage() { openPage('manage'); }
   function closeManagePage() { closePage(); }
@@ -1782,6 +1879,17 @@
     if (_wlPollTimer) { clearTimeout(_wlPollTimer); _wlPollTimer = null; }
   }
   // 路由标识：应用有时会把地址规范化成不带 baseURL 的形态，所以统一只比「尾段」
+  // 深路径时隐藏 SSR 的探索页（第一帧靠 head 里的标记 + CSS，这里负责后续切换）
+  function syncSsrExploreVisibility() {
+    try {
+      var tail = routeKey();
+      var deep = !!(tail && tail !== 'explore' && tail.indexOf('index') !== 0);
+      var cls = document.documentElement.classList;
+      if (deep) cls.add('txpd-deep-route');
+      else cls.remove('txpd-deep-route');
+    } catch (e) { /* 忽略 */ }
+  }
+
   function routeKey() {
     var p = window.location.pathname;
     if (p.indexOf(PANEL_BASE) === 0) p = p.slice(PANEL_BASE.length);
@@ -2238,11 +2346,12 @@
     var isAdmin = !!(ctx.g && isAdminRole(ctx.g.role));
     // 未加入该频道：只给「加入」（配置 / 定时 / 成员对非成员没有意义，点了也是报错）；
     // 加入按钮贴在频道名旁边，见下面的 joinSlot。
-    var want = joined ? (isAdmin ? ['config', 'schedule', 'members'] : ['schedule', 'members']) : [];
+    var want = joined ? (isAdmin ? ['config', 'schedule', 'members', 'leave'] : ['schedule', 'members', 'leave']) : [];
     var meta = {
       config: ['频道配置', 'assets/common.svg#guildSetting'],
       schedule: ['定时发帖', null],
       members: ['成员列表', 'assets/common.svg#user'],
+      leave: ['退出频道', 'assets/common.svg#withdraw'],
     };
     var box = document.querySelector('.txpd-op-btns');
     if (!box) {
@@ -2496,10 +2605,29 @@
   }
 
   var _navActiveKey = '';
-  function markNavActive(mine) {
+  function currentNavKey() {
+    // 打开插件的整页视图时，高亮对应的那一项（发私信整页算在「私信列表」上）
+    if (_pageOpen) {
+      // 页面 key → 导航 key：插件管理页的 key 是 manage，导航项是 admin
+      if (_pageOpen === 'dmSend') return 'dm';
+      if (_pageOpen === 'manage') return 'admin';
+      return _pageOpen;
+    }
     var tail = routeKey();
-    var cur = tail.indexOf('index') === 0 ? 'dynamic' : ((tail.indexOf('explore') === 0 || !tail) ? 'explore' : '');
-    if (cur === _navActiveKey) return;   // 路由没变就不写（避免 class 反复变动）
+    if (tail.indexOf('index') === 0) return 'dynamic';
+    if (tail.indexOf('explore') === 0 || !tail) return 'explore';
+    return '';
+  }
+  function markNavActive(mine) {
+    if (!mine) {
+      mine = {};
+      NAV_FIXED.forEach(function (slot) {
+        var n = document.querySelector('.txpd-nav-' + slot.key);
+        if (n) mine[slot.key] = n;
+      });
+    }
+    var cur = currentNavKey();
+    if (cur === _navActiveKey) return;   // 状态没变就不写（避免 class 反复变动）
     _navActiveKey = cur;
     Object.keys(mine).forEach(function (k) {
       if (!mine[k] || !mine[k].classList) return;
@@ -2515,8 +2643,9 @@
     var container = document.querySelector('.publish-editor-container');
     if (!container) return;
     if (!joined) {
-      // 未加入频道：恢复官方行为（移除接管标记）
+      // 未加入频道：恢复官方行为（移除接管标记，并把我们展开的编辑器收掉、官方节点恢复显示）
       if (container.getAttribute('data-txpd-hooked')) container.removeAttribute('data-txpd-hooked');
+      if (container.getAttribute('data-txpd-expanded') === '1') collapsePublishEditor();
       return;
     }
     var hint = container.querySelector('.editor-header .user-name');
@@ -2671,6 +2800,16 @@
   }
   // 幂等刷新：身份/加入方式随时可能从「未知」变为已知，每轮都按当前状态重绘同一行
   var _joinSettingTry = {};   // 频道号 -> 上次查询时间（8s 节流，避免卡死后再也不重试）
+  // 频道列表命中不了时，最多每 60 秒强制刷新一次（列表本身有 1 小时缓存）
+  var _refreshJoinedTs = 0;
+  function refreshJoinedSoon() {
+    var now = Date.now();
+    if (now - _refreshJoinedTs < 60000) return;
+    _refreshJoinedTs = now;
+    invalidateGuilds();
+    loadJoinedGuilds().then(function () { setTimeout(function () { ensureGuildMeta(); ensureTopbarButtons(); }, 0); }).catch(function () { });
+  }
+
   function guildMetaIdentity(num) {
     if (_guildsCache && _guildsCache.length) {
       var want = numVariants(num);
@@ -2688,6 +2827,13 @@
           }
         }
       }
+      // CLI 账号不是成员，但网页登录账号已加入（官方「我的频道」里有它）→ 说清楚是谁加入了，
+      // 并且顺手刷新一次频道列表（列表有 1 小时缓存，刚加入的频道可能还没进来）
+      var off = officialMemberKeys();
+      if ((num && off.gids[num]) || (pn && off.names[pn])) {
+        return { role: '已加入（网页账号）', gid: '', known: true };
+      }
+      refreshJoinedSoon();
       return { role: '未加入', gid: '', known: true };
     }
     return { role: '', gid: '', known: false };   // 列表还没拉回来 → 显示「加载中…」
@@ -2928,6 +3074,19 @@
   var _pubImages = [];
 
   function collapsePublishEditor() {
+    // 把我们追加的编辑器摘掉、官方子节点恢复显示（展开时只隐藏、没删）
+    var container0 = document.querySelector('.publish-editor-container');
+    if (container0) {
+      Array.prototype.forEach.call(Array.prototype.slice.call(container0.children), function (ch) {
+        if (ch.getAttribute && ch.getAttribute('data-txpd-hidden-editor') === '1') {
+          if (ch.style) ch.style.removeProperty('display');
+          ch.removeAttribute('data-txpd-hidden-editor');
+        } else if (ch.getAttribute && ch.getAttribute('data-txpd-editor-added') === '1' && ch.parentNode) {
+          ch.parentNode.removeChild(ch);   // 只摘我们自己插进去的节点
+        }
+      });
+      container0.removeAttribute('data-txpd-expanded');
+    }
     var container = document.querySelector('.publish-editor-container');
     if (!container) return;
     var ed = container.querySelector('.txpd-inline-editor');
@@ -2954,7 +3113,20 @@
     var container = document.querySelector('.publish-editor-container');
     if (!container || container.getAttribute('data-txpd-expanded') === '1') return;
     container.setAttribute('data-txpd-expanded', '1');
-    container.innerHTML = OFFICIAL_COMPOSER_HTML;
+    // 官方编辑器自己也在往这个容器里建视图，直接把 innerHTML 换掉会让它的 createView
+    // 找不到节点而抛错（Cannot set properties of null）。所以：官方的子节点**只隐藏**，
+    // 我们的编辑器作为新子节点追加进去。
+    Array.prototype.forEach.call(Array.prototype.slice.call(container.children), function (ch) {
+      ch.setAttribute('data-txpd-hidden-editor', '1');
+      if (ch.style) ch.style.setProperty('display', 'none', 'important');
+    });
+    var holder = el('div', { 'class': 'txpd-editor-holder' });
+    holder.innerHTML = OFFICIAL_COMPOSER_HTML;
+    while (holder.firstChild) {
+      var ch = holder.firstChild;
+      if (ch.nodeType === 1) ch.setAttribute('data-txpd-editor-added', '1');
+      container.appendChild(ch);
+    }
     var ctx = currentGuild();
     // 展开后自动聚焦输入区
     setTimeout(function () {
@@ -3771,14 +3943,44 @@
     return { bar: bar, setMode: setMode, _setMode: setMode };
   }
   // 帖子详情（帖子页 / 浮层）
-  function renderCliFeedDetail(body, feedId, guildId, channelId) {
+  // ---------- 帖子详情缓存（点开秒出）：命中 60 秒内的结果直接渲染 ----------
+  var _feedDetailCache = {};
+  var _feedDetailInflight = {};
+  function fetchFeedDetail(feedId, guildId, channelId) {
+    feedId = String(feedId || '');
+    var hit = _feedDetailCache[feedId];
+    if (hit && Date.now() - hit.ts < 60000) return Promise.resolve(hit.payload);
+    if (_feedDetailInflight[feedId]) return _feedDetailInflight[feedId];
+    var pr = api('/cli', { method: 'POST', body: { action: 'feed-detail', params: { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' } } }).then(function (r) {
+      delete _feedDetailInflight[feedId];
+      if (r && r.success) _feedDetailCache[feedId] = { ts: Date.now(), payload: r };
+      return r;
+    }).catch(function (e) {
+      delete _feedDetailInflight[feedId];
+      throw e;
+    });
+    _feedDetailInflight[feedId] = pr;
+    return pr;
+  }
+  // 悬停/按下时先把详情拉回来（真正点开时不用等）
+  function prefetchFeedDetail(feedId, guildId) {
+    feedId = String(feedId || '');
+    if (!feedId) return;
+    var hit = _feedDetailCache[feedId];
+    if (hit && Date.now() - hit.ts < 60000) return;
+    fetchFeedDetail(feedId, guildId || '', '').catch(function () { /* 预取失败不影响点击 */ });
+  }
+
+  function renderCliFeedDetail(body, feedId, guildId, channelId, fallbackUrl) {
+    body.setAttribute('data-feed', String(feedId || ''));
     body.innerHTML = '';
     var wrap = el('div', { 'class': 'txpd-cli-detail' });
     body.appendChild(wrap);
     wrap.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '正在通过插件账号加载帖子…'));
-    api('/cli', { method: 'POST', body: { action: 'feed-detail', params: { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' } } }).then(function (r) {
+    fetchFeedDetail(feedId, guildId, channelId).then(function (r) {
       var feed = (r.data && r.data.data && r.data.data.feed) || {};
       if (!r.success || !(feed.create_time_raw || feed.create_time)) throw new Error(r.message || '加载失败');
+      // CLI 拿不到内容（权限/风控等）→ 回退官方 iframe（有网页登录态时仍能看）
       var ctx = {
         feedId: feedId,
         guildId: feed.guild_id || guildId || '',
@@ -3923,6 +4125,7 @@
       loadComments();
     }).catch(function (e) {
       wrap.innerHTML = '';
+      if (fallbackUrl) { openEmbedOverlay(fallbackUrl, '帖子详情'); return; }   // CLI 拿不到就回退官方 iframe
       wrap.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '加载失败：' + String((e && e.message) || e).slice(0, 120)));
     });
   }
@@ -4402,7 +4605,7 @@
     return true;
   }
   // 访客限制频道：官方详情页同样被挡 → 用 CLI 数据在本插件浮层里渲染
-  function openCliDetailOverlay(feedId, guildId, title) {
+  function openCliDetailOverlay(feedId, guildId, title, fallbackUrl) {
     var ov = ensureOverlayShell();
     ov._frame.style.display = 'none';
     ov._dom.className = 'txpd-dom-detail';
@@ -4410,7 +4613,7 @@
     ov._dom.innerHTML = '';
     ov._title.textContent = title || '帖子详情';
     ov.style.display = 'flex';
-    renderCliFeedDetail(ov._dom, feedId, guildId, '');
+    renderCliFeedDetail(ov._dom, feedId, guildId, '', fallbackUrl);
     return true;
   }
   function openPostOverlay(href) {
@@ -4600,6 +4803,7 @@
       ensureGuildMeta();
       syncCommentPlaceholder();
       ensureGatedFallback();
+      syncSsrExploreVisibility();
       ensureDynamicPage();
       ensurePageView();       // 放在动态页之后：整页视图要能盖住动态页
       ensureLoginNotice();    // 缺登录态的页面显示「无法查看」提示
@@ -4635,6 +4839,7 @@
         else if (opKind === 'schedule') openPage('schedule');
         else if (opKind === 'members') openMemberList(opBtn);
         else if (opKind === 'join') openJoinFlow(currentGuildNumber());
+        else if (opKind === 'leave') openLeaveGuild(opBtn);
         return;
       }
       var btxt = btn && btn.textContent ? btn.textContent.trim() : '';
@@ -4785,14 +4990,48 @@
           }
         }
       }
+      // 鼠标扫过帖子卡片就先取详情（点开时不用等 CLI）；capture 阶段，避免被应用吞掉
+      if (!TXPD_EMBED) {
+        var preT = null;
+        window.addEventListener('mouseover', function (e) {
+          var a = e.target && e.target.closest ? e.target.closest('a[href*="/post/"]') : null;
+          if (!a) return;
+          if (a.getAttribute('data-txpd-cli-detail') === '1') { prefetchFeedDetail(a.getAttribute('data-feed'), a.getAttribute('data-guild')); return; }
+          var m2 = /\/g\/([^\/?#]+)\/post\/([^\/?#]+)/.exec(a.getAttribute('href') || '');
+          if (!m2) return;
+          if (preT) clearTimeout(preT);
+          preT = setTimeout(function () { prefetchFeedDetail(decodeURIComponent(m2[2]), ''); }, 120);
+        }, true);
+      }
       // 帖子卡片/详情链接 → 就地浮层打开详情，不再整页跳转（嵌入模式内部保持原生跳转）
       // 受限频道的卡片（data-txpd-cli-detail）走插件 CLI 详情浮层（官方详情页同样被挡）
       if (!TXPD_EMBED) {
         var postA = e.target && e.target.closest ? e.target.closest('a[href*="/post/"]') : null;
         if (postA && !(postA.closest && postA.closest('#txpd-pop'))) {
-          var opened = postA.getAttribute('data-txpd-cli-detail') === '1'
-            ? openCliDetailOverlay(postA.getAttribute('data-feed'), postA.getAttribute('data-guild'), '帖子详情')
-            : openPostOverlay(postA.getAttribute('href') || '');
+          var im = /\/g\/([^\/?#]+)\/post\/([^\/?#]+)/.exec(postA.getAttribute('href') || '');
+          var opened = false;
+          if (postA.getAttribute('data-txpd-cli-detail') === '1') {
+            opened = openCliDetailOverlay(postA.getAttribute('data-feed'), postA.getAttribute('data-guild'), '帖子详情');
+          } else if (im) {
+            // 官方帖卡不再走 iframe（要重载整个镜像页、启动应用，慢且会先闪探索页）：
+            // 直接用 CLI 详情浮层；CLI 拉不到再回退 iframe。
+            var pNum = decodeURIComponent(im[1]);
+            var pFeed = decodeURIComponent(im[2]);
+            var pGid = (currentGuild().num === pNum ? currentGuild().id : '') || _gidByNumber[pNum] || '';
+            opened = openCliDetailOverlay(pFeed, pGid, '帖子详情', postA.getAttribute('href') || '');
+            if (opened && !pGid) {
+              resolveGuildIdByNumber(pNum, function (gid2) {
+                if (!gid2) return;
+                var ov0 = document.getElementById('txpd-embed-overlay');
+                var body0 = document.getElementById('txpd-embed-dom');
+                if (ov0 && body0 && ov0.style.display === 'flex' && body0.getAttribute('data-feed') === String(pFeed)) {
+                  renderCliFeedDetail(body0, pFeed, gid2, '');
+                }
+              });
+            }
+          } else {
+            opened = openPostOverlay(postA.getAttribute('href') || '');
+          }
           if (opened) {
             e.preventDefault();
             e.stopImmediatePropagation();
