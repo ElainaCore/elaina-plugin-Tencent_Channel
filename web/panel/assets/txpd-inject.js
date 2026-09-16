@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var TXPD_API = '/api/ext/txpd';
+  var TXPD_API = '/api/ext/tencent-channel';
   var PROXY_PREFIX = TXPD_API + '/pd/';
   var PANEL_BASE = TXPD_API + '/panel/';
   // 命中 qq 域的浏览器请求一律改写成本地 404，不触达 qq.com
@@ -15,7 +15,7 @@
   } catch (e) { /* 顶层跨域访问失败 → 视为非嵌入 */ }
 
   // ---------- iframe 地址对齐：必须在应用 bundle 之前执行 ----------
-  // Nuxt 的 app.baseURL 是 PANEL_BASE，但 iframe 文档地址是宿主的 /api/web-pages/txpd-panel，
+  // Nuxt 的 app.baseURL 是 PANEL_BASE，但 iframe 文档地址是宿主的 /api/web-pages/tencent-channel-panel，
   // 不含 base 前缀 → vue-router 剥离 base 失败 → 静默白屏。
   // 仅当地址不在 base 下时才改写：优先恢复会话里最后访问的深层路径（刷新不丢位置），
   // 没有则回到 explore；深层路由（/g/xxx/post/yyy 整页加载）已在 base 下，保留原地址。
@@ -180,7 +180,7 @@
     return false;
   }
   function toProxy(u) {
-    // 相对路径（/qunng/...）→ /api/ext/txpd/pd/qunng/...
+    // 相对路径（/qunng/...）→ /api/ext/tencent-channel/pd/qunng/...
     if (u.indexOf('&') > 0 && u.indexOf('/trpc') > 0 && u.charAt(0) !== '/') {
       // mobile 形态: "<finalPath>?<query>&origin_url=..." 整体作为 tail
       return PROXY_PREFIX + u;
