@@ -202,7 +202,9 @@ async def _joined_keys(user: str) -> Dict[str, Any]:
         async with _cli_lock:
             res = await _run_cli_json(["manage", "get-my-join-guild-info", "--json"], user)
         data = ((res or {}).get("data") or {}).get("data") or {}
-        for g in (data.get("created_guilds") or []) + (data.get("joined_guilds") or []):
+        # 三个列表都算「已加入」：created（我创建的）/ managed（我是管理员·小管家）/ joined（普通成员）
+        for g in ((data.get("created_guilds") or []) + (data.get("managed_guilds") or [])
+                  + (data.get("joined_guilds") or [])):
             num = str(g.get("guild_number") or "")
             if not num:
                 continue

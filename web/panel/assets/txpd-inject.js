@@ -42,6 +42,8 @@
   //    合并进 getter；真实数据鉴权仍由代理在服务端完成。
   var VIRTUAL_COOKIES = {};
   var TXPD_USER = '';
+  var TXPD_WEB_LOGGED_IN = false;   // 网页登录态（只影响显示），由下面的 /panel-cookie 赋值
+  var _cliLoggedIn = null;          // CLI 账号登录态快照：null = 还没查过
   // 注意：页面上的「网页登录」只用于按登录态显示内容，点赞/评论/发帖等操作**始终**由
   // CLI 账号完成（不随网页登录态切换账号），所以这里没有「CLI 模式」开关了。
   try {
@@ -87,6 +89,7 @@
         var c = (r && r.data && r.data.cookies) || {};
         for (var k in c) VIRTUAL_COOKIES[k] = c[k];
         TXPD_USER = (r && r.data && r.data.user) || '';
+        TXPD_WEB_LOGGED_IN = !!(r && r.data && r.data.session_valid);
         // 不给页面注入假 p_skey：实测假登录态会让探索页走登录态数据流（推荐接口需真实会话）而报
         // 「加载失败」。真实会话由面板里的「网页登录」提供，只影响显示；操作一律走 CLI。
       }
@@ -502,6 +505,20 @@
     '.txpd-mg-qr img{width:168px;height:168px;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;background:#fff;}',
     '.txpd-mg-qr-tip{margin-top:8px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
     '.txpd-mg-textarea{width:100%;min-height:110px;box-sizing:border-box;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;padding:10px 12px;font-size:13px;font-family:inherit;line-height:1.6;resize:vertical;color:var(--text-primary,#222);background:var(--bg-middle-light,#fff);}',
+    // 定时计划条目
+    '.txpd-sched-item{border-top:1px solid var(--border-primary,rgba(219,220,224,.6));padding:12px 0;}',
+    '.txpd-sched-item:first-child{border-top:none;padding-top:2px;}',
+    '.txpd-sched-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
+    '.txpd-sched-name{font-size:14px;font-weight:600;color:var(--text-primary,#222);}',
+    '.txpd-sched-tag{font-size:11px;padding:1px 8px;border-radius:100px;background:#f0f1f5;color:#8a8a8a;}',
+    '.txpd-sched-tag.on{background:#e8f6ee;color:#15a361;}',
+    '.txpd-sched-cron{font-size:12px;color:var(--text-link,#2b64f5);}',
+    '.txpd-sched-meta{margin-top:4px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
+    '.txpd-sched-body{margin-top:4px;font-size:13px;color:var(--text-primary,#333);line-height:1.6;word-break:break-word;}',
+    // 缺登录态时的整页提示
+    '.txpd-login-notice{display:flex;align-items:flex-start;justify-content:center;height:100%;padding:64px 22px 0;box-sizing:border-box;}',
+    '.txpd-notice-card{max-width:520px;width:100%;}',
+    '.txpd-notice-card h3{margin:0 0 8px;font-size:15px;font-weight:600;color:var(--text-primary,#222);}',
     // 未加入频道的顶栏「加入」按钮（贴在频道名旁边）
     '.txpd-join-slot{display:inline-flex;align-items:center;margin-left:10px;flex:none;vertical-align:middle;}',
     '.txpd-join-btn{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 12px;border:none;border-radius:100px;background:var(--feedback-brand,#2b64f5);color:#fff;font-size:12px;font-family:inherit;cursor:pointer;flex:none;}',
@@ -631,6 +648,8 @@
 
   // ---------- 账号状态（缓存 10s）：决定登录按钮的形态 ----------
   var _acctAny = null, _acctTs = 0;
+  // 登录态快照（TXPD_WEB_LOGGED_IN / _cliLoggedIn）声明在文件顶部：
+  // 那里先声明再赋值，避免 var 初始化顺序把 loadVirtualCookies 写入的值覆盖回 false
   function acctCacheKey() { return 'txpd_acct_state_v1_' + (TXPD_USER || 'default'); }
   function setAcctState(any) {
     _acctAny = any; _acctTs = Date.now();
@@ -653,6 +672,7 @@
     return api('/accounts').then(function (r) {
       var accs = (r.data && r.data.accounts) || [];
       setAcctState(accs.some(function (a) { return a.logged_in; }));
+      _cliLoggedIn = _acctAny;   // 未登录时页面要显示「CLI 未登录，无法查看」
       return _acctAny;
     });
   }
@@ -819,25 +839,51 @@
   // 「未加入的频道」分组里当前频道条目下方；按用户要求移到左侧边栏
   // 「已加入的频道」里对应频道名下，未加入分组只留真正的临时条目 ----------
   var _movedChannelList = null;
+  var _movedChannelHome = null;   // 官方会话列表原来的父节点（收起时放回去，不删）
+
+  // 收起重排的会话列表：优先「放回原位」，保持应用自己的 DOM 形状。
+  // 直接 remove 会让 Vue 之后 insertBefore 找不到参照节点（报 is not a child of this node）。
+  function restoreChannelList() {
+    var node = _movedChannelList;
+    _movedChannelList = null;
+    if (!node || !node.parentNode) return;
+    node.removeAttribute('data-txpd-moved');
+    node.style.cssText = '';
+    // 之前隐藏的官方「展开全部」也恢复（它只在列表被移走时才需要藏）
+    Array.prototype.forEach.call(node.querySelectorAll('[data-txpd-hidden]'), function (ch) {
+      ch.style.removeProperty('display');
+      ch.removeAttribute('data-txpd-hidden');
+    });
+    if (_movedChannelHome && _movedChannelHome.isConnected) {
+      _movedChannelHome.appendChild(node);
+    } else {
+      node.parentNode.removeChild(node);   // 原位置已经没了（换过频道/被应用重建）→ 只能移除
+    }
+    _movedChannelHome = null;
+  }
 
   function moveChannelList() {
     var num = currentGuildNumber();
     var dst = num ? document.querySelector('.aside-group--txpd-joined .my-guild-item[data-gnum="' + num + '"]') : null;
     // 非频道视图，或当前频道未加入（不在我的分区）→ 收起已移入的会话列表
     if (!dst) {
-      if (_movedChannelList && _movedChannelList.parentNode) _movedChannelList.parentNode.removeChild(_movedChannelList);
-      _movedChannelList = null;
+      restoreChannelList();
       return;
     }
     var src = document.querySelector('.aside-group--my-temp-guild .channel-list');
     if (!src || src.getAttribute('data-txpd-moved') === '1') return;
-    if (_movedChannelList && _movedChannelList.parentNode) _movedChannelList.parentNode.removeChild(_movedChannelList);
+    restoreChannelList();
+    _movedChannelHome = src.parentNode;
     src.setAttribute('data-txpd-moved', '1');
     src.style.cssText = 'padding:0 0 6px 6px;';
     src.classList.remove('txpd-show-all');
-    // 官方「展开全部」节点直接删除（隐藏会被展开态 CSS 重新显示，出现两个切换）
+    // 官方「展开全部」节点隐藏即可（同样不删：它是应用管理的节点）。
+    // 用 inline !important 才能压过官方的展开态样式（普通 display:none 会被重新显示出来）
     Array.prototype.forEach.call(src.children, function (ch) {
-      if ((ch.innerText || '').indexOf('展开全部') !== -1 && ch.parentNode) ch.parentNode.removeChild(ch);
+      if ((ch.innerText || '').indexOf('展开全部') !== -1) {
+        ch.style.setProperty('display', 'none', 'important');
+        ch.setAttribute('data-txpd-hidden', '1');
+      }
     });
     dst.parentNode.insertBefore(src, dst.nextSibling);
     _movedChannelList = src;
@@ -1079,7 +1125,9 @@
       if (!r.success) return []; // 未登录等：不缓存，登录后下次轮询重取
       var data = (r.data && r.data.data) || {};
       var seen = {}, all = [];
-      (data.created_guilds || []).concat(data.joined_guilds || []).forEach(function (g) {
+      // 三个列表都要算「已加入」：created（我创建的）/ managed（我是管理员·小管家）/
+      // joined（普通成员）。漏掉 managed 会让管理员身份在面板里显示成「未加入」。
+      (data.created_guilds || []).concat(data.managed_guilds || [], data.joined_guilds || []).forEach(function (g) {
         if (g && g.guild_id && !seen[g.guild_id]) { seen[g.guild_id] = 1; all.push(g); }
       });
       setJoinedCache(all);
@@ -1310,22 +1358,6 @@
   function selectStyle() {
     return 'width:100%;box-sizing:border-box;border:1px solid var(--border-input-box,rgba(219,220,224,.9));border-radius:8px;padding:8px 10px;font-size:13px;outline:none;font-family:inherit;background:var(--bg-middle-light,#fff);color:var(--text-primary,#222);';
   }
-  function openScheduleDialog(preGuild, anchor) {
-    var dlgP = openPopover(anchor, '定时发帖');
-    var loading = el('div', { style: 'color:#999;font-size:13px;padding:10px 0;' }, '加载中…');
-    dlgP.appendChild(loading);
-    loadJoinedGuilds().then(function () {
-      if (loading.parentNode) loading.parentNode.removeChild(loading);
-      if (!_guildsCache || !_guildsCache.length) {
-        dlgP.appendChild(el('div', { style: 'color:#999;font-size:13px;padding:10px 0;' }, '暂无已加入的频道，无法设置定时发帖'));
-        return;
-      }
-      buildScheduleForm(dlgP, preGuild);
-    }).catch(function (e) {
-      if (loading.parentNode) loading.parentNode.removeChild(loading);
-      dlgP.appendChild(el('div', { style: 'color:#e5484d;font-size:13px;padding:10px 0;' }, '加载失败：' + String((e && e.message) || e).slice(0, 200)));
-    });
-  }
   function buildScheduleForm(dlgP, preGuild) {
     var cur = preGuild && preGuild.num ? preGuild.num : currentGuildNumber();
     var gSel = el('select'); gSel.style.cssText = selectStyle();
@@ -1529,19 +1561,30 @@
   }
 
   // ---------- 私信发送（CLI push-dm） ----------
-  function openDmSend(nick, tinyId, sourceGuildId, fromList) {
-    var dlgP = openDrawer('私信：' + (nick || tinyId || ''));
-    if (fromList) {
-      var back = el('div', { style: 'font-size:12px;color:#2b64f5;cursor:pointer;margin-bottom:8px;' }, '← 返回私信列表');
-      back.addEventListener('click', function () { openDmList(); });
-      dlgP.appendChild(back);
-    }
-    var ta = areaInput('消息内容…', '', 100);
-    var send = primaryBtn('发送');
-    var status = statusLine();
-    dlgP.appendChild(ta);
-    dlgP.appendChild(send);
-    dlgP.appendChild(status);
+  // 发私信：整页（与私信列表同一套页面机制，返回即回列表）
+  var _dmCompose = { nick: '', tiny: '', guildId: '' };
+  function openDmSend(nick, tinyId, sourceGuildId) {
+    _dmCompose = { nick: nick || '', tiny: tinyId || '', guildId: sourceGuildId || '' };
+    openPage('dmSend');
+  }
+  function buildDmSendPage() {
+    var page = el('div', { 'class': 'app-page txpd-manage txpd-dm-send-page' });
+    var head = el('div', { 'class': 'txpd-mg-head' });
+    var back = mgBtn('← 返回私信列表');
+    back.addEventListener('click', function () { openPage('dm'); });
+    head.appendChild(back);
+    head.appendChild(el('span', { 'class': 'txpd-mg-title', id: 'txpd-dm-peer' }, '发私信'));
+    page.appendChild(head);
+    var card = mgCard(null, '消息由频道账号（CLI）发送，因此不需要网页登录。');
+    var ta = areaInput('消息内容…', '', 120);
+    card.appendChild(ta);
+    var row = el('div', { 'class': 'txpd-mg-row', style: 'margin-top:10px;' });
+    var send = mgBtn('发送', true);
+    var status = el('span', { 'class': 'txpd-mg-status' }, '');
+    row.appendChild(send);
+    row.appendChild(status);
+    card.appendChild(row);
+    page.appendChild(card);
     send.addEventListener('click', function () {
       var text = ta.value.trim();
       if (!text) { panelError(status, '请输入内容'); return; }
@@ -1549,69 +1592,87 @@
       status.style.color = '#888';
       status.textContent = '正在发送…';
       var params = { text: text };
-      if (tinyId) params.peer_tiny_id = tinyId;
-      if (sourceGuildId) params.source_guild_id = sourceGuildId;
+      if (_dmCompose.tiny) params.peer_tiny_id = _dmCompose.tiny;
+      if (_dmCompose.guildId) params.source_guild_id = _dmCompose.guildId;
       api('/cli', { method: 'POST', body: { action: 'push-dm', params: params } }).then(function (r) {
         if (!r.success) throw new Error(r.message || '发送失败');
-        status.textContent = '✓ 已发送';
         status.style.color = '#15a361';
+        status.textContent = '✓ 已发送';
         try {
           var hist = JSON.parse(window.localStorage.getItem('txpd_dm_history') || '[]');
-          hist.unshift({ nick: nick, tiny: tinyId, text: text, ts: Date.now() });
+          hist.unshift({ nick: _dmCompose.nick, tiny: _dmCompose.tiny, text: text, ts: Date.now() });
           window.localStorage.setItem('txpd_dm_history', JSON.stringify(hist.slice(0, 50)));
         } catch (e) { /* 忽略 */ }
-      }).catch(function (e) { panelError(status, e.message); }).then(function () { send.disabled = false; });
+        ta.value = '';
+        toast('✓ 已发送');
+        setTimeout(function () { openPage('dm'); }, 900);   // 回到列表，能看到新记录
+      }).catch(function (e) {
+        panelError(status, e.message);
+      }).then(function () { send.disabled = false; });
     });
+    return page;
+  }
+  function syncDmSendPage() {
+    var t = document.getElementById('txpd-dm-peer');
+    if (t) t.textContent = '发私信：' + (_dmCompose.nick || _dmCompose.tiny || '');
   }
 
   // ---------- 私信列表（本地发送历史按联系人聚合） ----------
-  function openDmList() {
-    var dlgP = openDrawer('私信');
-    var box = el('div', { style: 'max-height:380px;overflow:auto;' });
-    dlgP.appendChild(box);
-    var hist = [];
-    try { hist = JSON.parse(window.localStorage.getItem('txpd_dm_history') || '[]'); } catch (e) { /* 忽略 */ }
-    var byPeer = {};
-    hist.forEach(function (h) {
-      var key = h.tiny || h.nick || '?';
-      if (!byPeer[key]) byPeer[key] = { nick: h.nick, tiny: h.tiny, last: h.text, ts: h.ts };
-    });
-    var keys = Object.keys(byPeer);
-    if (!keys.length) {
-      box.appendChild(el('div', { style: 'color:#999;font-size:13px;padding:20px 0;text-align:center;' }, '暂无私信记录（从成员列表点击成员名字可发起私信）'));
-      return;
-    }
-    keys.forEach(function (k) {
-      var p = byPeer[k];
-      var row = el('div', { 'class': 'txpd-acct-item' });
-      row.appendChild(el('span', { 'class': 'txpd-acct-dot' }));
-      var main = el('div', { style: 'flex:1;min-width:0;' });
-      main.appendChild(el('div', { 'class': 'txpd-acct-name', style: 'font-weight:600;' }, p.nick || p.tiny || k));
-      main.appendChild(el('div', { style: 'font-size:12px;color:#999;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' }, (p.last || '').slice(0, 40)));
-      row.appendChild(main);
-      row.addEventListener('click', function () { openDmSend(p.nick, p.tiny, '', true); });
-      box.appendChild(row);
-    });
-  }
-
-  // ---------- 插件管理（整页视图，替代原右侧抽屉） ----------
-  // 三个板块：网页登录（只影响页面按登录态显示内容）/ 频道账号（CLI，发帖评论等操作用它）/ 插件管理员。
-  var _manageOpen = false;
-  var _managePath = '';
-  var _managePage = null;
+  // ---------- 整页视图：插件管理 / 定时发帖 / 私信列表 ----------
+  // 三页共用「盖住应用内容 + 返回还原」的机制；节点缓存在 _pageViews 里复用，
+  // 应用重渲染把节点挪走/删掉时只负责贴回去（重建会让元素身份变化，按钮点一半就失效）。
+  var _pageViews = {};   // key -> 节点
+  var _pageOpen = '';    // 当前打开的页面 key（'' = 没有）
+  var _pagePath = '';    // 打开时的路由（路由变了自动收起）
+  var PAGE_BUILDERS = {};   // key -> build 函数（各自的 build 函数定义后填充）
   var _wlPollTimer = null;
   var _wlActive = false;   // 一条轮询链是否在跑（定时器等待中 + 请求中）
   var _wlImgUrl = '';
   var _wlDone = false;   // 本轮二维码已到终态（成功/失效/失败），不再轮询
 
-  function openManagePage() {
-    _manageOpen = true;
-    _managePath = routeKey();
-    ensureManagePage();
+  function openPage(key) {
+    _pageOpen = key;
+    _pagePath = routeKey();
+    ensurePageView();
   }
-  function closeManagePage() {
-    _manageOpen = false;
-    ensureManagePage();
+  function closePage() {
+    _pageOpen = '';
+    ensurePageView();
+  }
+  function openManagePage() { openPage('manage'); }
+  function closeManagePage() { closePage(); }
+  function ensurePageView() {
+    // 用户点了别的导航/频道 → 自动收起（整页视图不跟随应用路由）
+    if (_pageOpen && _pagePath && routeKey() !== _pagePath) _pageOpen = '';
+    var explore = document.getElementById('explorePage');
+    var dyn = document.querySelector('.txpd-dynamic');
+    var guildMain = document.querySelector('.game-guild-main');
+    Object.keys(_pageViews).forEach(function (k) {
+      var n = _pageViews[k];
+      if (k !== _pageOpen && n && n.parentNode) n.parentNode.removeChild(n);
+    });
+    if (!_pageOpen) {
+      if (dyn) dyn.style.display = '';
+      if (guildMain) guildMain.style.display = '';
+      return;
+    }
+    var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main') || document.body;
+    if (!host) return;
+    if (explore) explore.style.display = 'none';
+    if (dyn) dyn.style.display = 'none';
+    if (guildMain) guildMain.style.display = 'none';
+    var node = _pageViews[_pageOpen];
+    if (!node) {
+      var build = PAGE_BUILDERS[_pageOpen];
+      if (!build) return;
+      node = build();
+      _pageViews[_pageOpen] = node;
+    }
+    if (node.parentNode !== host) host.appendChild(node);
+    if (_pageOpen === 'manage') { restoreWebLoginUi(); syncManageStatus(); }
+    else if (_pageOpen === 'schedule') syncSchedulePage();
+    else if (_pageOpen === 'dm') syncDmPage();
+    else if (_pageOpen === 'dmSend') syncDmSendPage();
   }
   function stopWebLoginPoll() {
     if (_wlPollTimer) { clearTimeout(_wlPollTimer); _wlPollTimer = null; }
@@ -1621,30 +1682,6 @@
     var p = window.location.pathname;
     if (p.indexOf(PANEL_BASE) === 0) p = p.slice(PANEL_BASE.length);
     return p.replace(/^\/+/, '').replace(/\/+$/, '');
-  }
-
-  function ensureManagePage() {
-    var explore = document.getElementById('explorePage');
-    var dyn = document.querySelector('.txpd-dynamic');
-    // 用户点了别的导航/频道 → 自动收起（整页视图不跟随应用路由）
-    if (_manageOpen && _managePath && routeKey() !== _managePath) _manageOpen = false;
-    if (!_manageOpen) {
-      if (_managePage && _managePage.parentNode) _managePage.parentNode.removeChild(_managePage);
-      if (dyn) dyn.style.display = '';
-      return;
-    }
-    var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main');
-    if (!host) return;
-    if (explore) explore.style.display = 'none';
-    if (dyn) dyn.style.display = 'none';
-    // 复用同一个页面节点：应用重渲染会把我们塞进去的节点挪走/删掉，重建会让元素身份变化
-    // （按钮点一半就失效），所以只负责「贴回去」。
-    if (!_managePage) _managePage = buildManagePage();
-    if (_managePage.parentNode !== host) {
-      host.appendChild(_managePage);
-      restoreWebLoginUi();   // 刚被贴回：把二维码贴回并确保轮询还活着
-    }
-    syncManageStatus();
   }
 
   // 整页视图被应用重渲染后贴回：把仍在轮询中的二维码也贴回去并继续轮询
@@ -1841,10 +1878,216 @@
     }).catch(function () { /* 忽略 */ });
   }
 
+  // ---------- 定时发帖（整页视图：全部计划列表 + 新建 + 逐条删除/启停/立即运行） ----------
+  function cronText(cron) {
+    var m = /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/.exec(String(cron || '').trim());
+    if (!m) return cron || '';
+    var mi = m[1], h = m[2], dom = m[3], mon = m[4], dow = m[5];
+    var pad = function (x) { return String(x).length < 2 ? '0' + x : String(x); };
+    var wd = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    if (/^\d+$/.test(mi) && /^\d+$/.test(h) && dom === '*' && mon === '*' && dow === '*') return '每天 ' + pad(h) + ':' + pad(mi);
+    if (/^\d+$/.test(mi) && /^\d+$/.test(h) && dom === '*' && mon === '*' && /^\d$/.test(dow)) {
+      return '每' + wd[Number(dow)] + ' ' + pad(h) + ':' + pad(mi);
+    }
+    if (mi.indexOf('*/') === 0 && h === '*' && dom === '*' && mon === '*' && dow === '*') return '每 ' + mi.slice(2) + ' 分钟';
+    return cron;
+  }
+  function scheduleGuildName(gid) {
+    if (_guildsCache) {
+      for (var i = 0; i < _guildsCache.length; i++) {
+        if (String(_guildsCache[i].guild_id) === String(gid)) return _guildsCache[i].name || gid;
+      }
+    }
+    return gid || '—';
+  }
+  function buildSchedulePage() {
+    var page = el('div', { 'class': 'app-page txpd-manage txpd-sched-page' });
+    var head = el('div', { 'class': 'txpd-mg-head' });
+    var back = mgBtn('← 返回');
+    back.addEventListener('click', closePage);
+    head.appendChild(back);
+    head.appendChild(el('span', { 'class': 'txpd-mg-title' }, '定时发帖'));
+    var refresh = mgBtn('刷新');
+    refresh.addEventListener('click', function () { syncSchedulePage(true); });
+    head.appendChild(refresh);
+    var add = mgBtn('+ 新建计划', true);
+    head.appendChild(add);
+    page.appendChild(head);
+
+    var listCard = mgCard('全部定时计划', '到点由插件账号（CLI）自动发帖；可单独启停、立即运行或删除。');
+    listCard.appendChild(el('div', { id: 'txpd-sched-list' }));
+    page.appendChild(listCard);
+
+    var formCard = mgCard('新建计划', '选择频道与版块、设置频率与内容，保存后即生效。');
+    formCard.style.display = 'none';
+    page.appendChild(formCard);
+    add.addEventListener('click', function () {
+      var opened = formCard.style.display !== 'none';
+      formCard.style.display = opened ? 'none' : '';
+      add.textContent = opened ? '+ 新建计划' : '收起表单';
+      if (!opened && !formCard._built) {
+        formCard._built = 1;
+        loadJoinedGuilds().then(function () {
+          if (!_guildsCache || !_guildsCache.length) {
+            formCard.appendChild(el('div', { 'class': 'txpd-mg-status' }, '暂无已加入的频道，先加入频道再设置定时发帖'));
+            return;
+          }
+          buildScheduleForm(formCard, currentGuild());
+        }).catch(function (e) {
+          formCard.appendChild(el('div', { 'class': 'txpd-mg-status', style: 'color:#e5484d;' }, '加载失败：' + String((e && e.message) || e).slice(0, 160)));
+        });
+      }
+    });
+    return page;
+  }
+  var _schedTs = 0;
+  function syncSchedulePage(force) {
+    var box = document.getElementById('txpd-sched-list');
+    if (!box) return;
+    var now = Date.now();
+    if (!force && now - _schedTs < 3000) return;
+    _schedTs = now;
+    api('/schedules').then(function (r) {
+      var list = (r && r.data && r.data.schedules) || [];
+      box.innerHTML = '';
+      if (!list.length) {
+        box.appendChild(el('div', { 'class': 'txpd-mg-status' }, '暂无定时计划，点右上角「+ 新建计划」添加'));
+        return;
+      }
+      list.forEach(function (sc) {
+        var item = el('div', { 'class': 'txpd-sched-item' });
+        var top = el('div', { 'class': 'txpd-sched-top' });
+        top.appendChild(el('span', { 'class': 'txpd-sched-name' }, sc.name || '未命名计划'));
+        top.appendChild(el('span', { 'class': 'txpd-sched-tag' + (sc.enabled ? ' on' : '') }, sc.enabled ? '启用中' : '已停用'));
+        top.appendChild(el('span', { 'class': 'txpd-sched-cron' }, cronText(sc.cron)));
+        item.appendChild(top);
+        var meta = ['频道 ' + scheduleGuildName(sc.guild_id)];
+        if (sc.user) meta.push('账号 ' + sc.user);
+        if (sc.last_run) meta.push('上次 ' + sc.last_run + (sc.last_result ? '（' + String(sc.last_result).slice(0, 20) + '）' : ''));
+        item.appendChild(el('div', { 'class': 'txpd-sched-meta' }, meta.join(' · ')));
+        item.appendChild(el('div', { 'class': 'txpd-sched-body' },
+          (sc.title ? sc.title + '：' : '') + String(sc.content || '').replace(/\s+/g, ' ').slice(0, 90)));
+        var acts = el('div', { 'class': 'txpd-mg-row', style: 'margin-top:8px;' });
+        var st = el('span', { 'class': 'txpd-mg-status' }, '');
+        var bToggle = mgBtn(sc.enabled ? '停用' : '启用');
+        var bRun = mgBtn('立即运行');
+        var bDel = mgBtn('删除');
+        bDel.style.color = '#e5484d';
+        bToggle.addEventListener('click', function () {
+          bToggle.disabled = true;
+          api('/schedules/toggle', { method: 'POST', body: { id: sc.id } }).then(function (rr) {
+            st.style.color = rr.success ? '#15a361' : '#e5484d';
+            st.textContent = rr.message || '';
+            syncSchedulePage(true);
+          }).catch(function (e) { st.textContent = String(e.message || e); });
+        });
+        bRun.addEventListener('click', function () {
+          bRun.disabled = true;
+          st.style.color = '#888';
+          st.textContent = '正在发送…';
+          api('/schedules/run', { method: 'POST', body: { id: sc.id } }).then(function (rr) {
+            st.style.color = rr.success ? '#15a361' : '#e5484d';
+            st.textContent = rr.message || (rr.success ? '✓ 已发送' : '执行失败');
+            bRun.disabled = false;
+            syncSchedulePage(true);
+          }).catch(function (e) { st.style.color = '#e5484d'; st.textContent = String(e.message || e); bRun.disabled = false; });
+        });
+        // 删除：两段式确认（再点一次才真删），避免误删
+        var arming = false;
+        bDel.addEventListener('click', function () {
+          if (!arming) {
+            arming = true;
+            bDel.textContent = '确认删除';
+            st.style.color = '#e5484d';
+            st.textContent = '再点一次将删除该计划';
+            return;
+          }
+          bDel.disabled = true;
+          api('/schedules/delete', { method: 'POST', body: { id: sc.id } }).then(function (rr) {
+            if (!rr.success) throw new Error(rr.message || '删除失败');
+            st.style.color = '#15a361';
+            st.textContent = '✓ 已删除';
+            syncSchedulePage(true);
+          }).catch(function (e) {
+            st.style.color = '#e5484d';
+            st.textContent = String(e.message || e);
+            bDel.disabled = false;
+            arming = false;
+            bDel.textContent = '删除';
+          });
+        });
+        acts.appendChild(bToggle);
+        acts.appendChild(bRun);
+        acts.appendChild(bDel);
+        acts.appendChild(st);
+        item.appendChild(acts);
+        box.appendChild(item);
+      });
+    }).catch(function (e) {
+      box.innerHTML = '';
+      box.appendChild(el('div', { 'class': 'txpd-mg-status', style: 'color:#e5484d;' }, '加载失败：' + String((e && e.message) || e).slice(0, 160)));
+    });
+  }
+
+  // ---------- 私信列表（整页视图） ----------
+  function buildDmPage() {
+    var page = el('div', { 'class': 'app-page txpd-manage txpd-dm-page' });
+    var head = el('div', { 'class': 'txpd-mg-head' });
+    var back = mgBtn('← 返回');
+    back.addEventListener('click', closePage);
+    head.appendChild(back);
+    head.appendChild(el('span', { 'class': 'txpd-mg-title' }, '私信列表'));
+    var refresh = mgBtn('刷新');
+    refresh.addEventListener('click', function () { syncDmPage(true); });
+    head.appendChild(refresh);
+    page.appendChild(head);
+    var card = mgCard('最近联系人', '这里只显示本机记录过的私信会话；点一行继续给对方发私信（由频道账号 CLI 发送）。');
+    card.appendChild(el('div', { id: 'txpd-dm-list' }));
+    page.appendChild(card);
+    return page;
+  }
+  var _dmTs = 0;
+  function syncDmPage(force) {
+    var box = document.getElementById('txpd-dm-list');
+    if (!box) return;
+    var now = Date.now();
+    if (!force && now - _dmTs < 2000) return;
+    _dmTs = now;
+    var hist = [];
+    try { hist = JSON.parse(window.localStorage.getItem('txpd_dm_history') || '[]'); } catch (e) { /* 忽略 */ }
+    var byPeer = {};
+    hist.forEach(function (h) {
+      var key = h.tiny || h.nick || '?';
+      if (!byPeer[key]) byPeer[key] = { nick: h.nick, tiny: h.tiny, last: h.text, ts: h.ts };
+    });
+    var keys = Object.keys(byPeer);
+    box.innerHTML = '';
+    if (!keys.length) {
+      box.appendChild(el('div', { 'class': 'txpd-mg-status' }, '暂无私信记录（从成员列表点击成员名字可发起私信）'));
+      return;
+    }
+    keys.forEach(function (k) {
+      var pp = byPeer[k];
+      var row = el('div', { 'class': 'txpd-acct-item' });
+      row.appendChild(el('span', { 'class': 'txpd-acct-dot' }));
+      var main = el('div', { style: 'flex:1;min-width:0;' });
+      main.appendChild(el('div', { 'class': 'txpd-acct-name', style: 'font-weight:600;' }, pp.nick || pp.tiny || k));
+      main.appendChild(el('div', { style: 'font-size:12px;color:#999;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' }, (pp.last || '').slice(0, 60)));
+      row.appendChild(main);
+      row.addEventListener('click', function () { openDmSend(pp.nick, pp.tiny, '', true); });
+      box.appendChild(row);
+    });
+  }
+
+  PAGE_BUILDERS.manage = buildManagePage;
+  PAGE_BUILDERS.schedule = buildSchedulePage;
+  PAGE_BUILDERS.dm = buildDmPage;
+  PAGE_BUILDERS.dmSend = buildDmSendPage;
+
   // 没有 CLI 账号（未登录/无槽位）时自动打开插件管理，引导先登录
   var _manageAutoTried = false;
   function maybeAutoOpenManage() {
-    if (_manageAutoTried || _manageOpen) return;
+    if (_manageAutoTried || _pageOpen) return;
     api('/accounts').then(function (r) {
       var accs = ((r && r.data && r.data.accounts) || []);
       var anyIn = accs.some(function (a) { return a.logged_in; });
@@ -1865,6 +2108,11 @@
       + '<path d="M6.88306 3.79199V7.58366H9.9165" fill="none" stroke="currentColor" stroke-width="0.875"></path></svg>';
     return tmp.firstChild;
   }
+  // 管理身份判定：CLI 的角色文案是「腾讯频道主 / 频道主 / 管理员」，宽松匹配防止文案差异漏判
+  function isAdminRole(role) {
+    var r = String(role || '');
+    return r.indexOf('频道主') !== -1 || r.indexOf('管理员') !== -1;
+  }
   function ensureTopbarButtons() {
     // 旧的带文字顶栏按钮：删除（用户要求只保留图标）
     Array.prototype.forEach.call(document.querySelectorAll('.top_title > .txpd-top-btns'), function (n) {
@@ -1876,7 +2124,7 @@
     // 否则「加入」按钮会在已加入的频道上闪一下
     if (!_joinedKeys) return;
     var joined = !!(_joinedKeys[ctx.num] || (ctx.g && ctx.g.guild_id && _joinedKeys[ctx.g.guild_id]));
-    var isAdmin = !!(ctx.g && (ctx.g.role === '腾讯频道主' || ctx.g.role === '管理员'));
+    var isAdmin = !!(ctx.g && isAdminRole(ctx.g.role));
     // 未加入该频道：只给「加入」（配置 / 定时 / 成员对非成员没有意义，点了也是报错）；
     // 加入按钮贴在频道名旁边，见下面的 joinSlot。
     var want = joined ? (isAdmin ? ['config', 'schedule', 'members'] : ['schedule', 'members']) : [];
@@ -1939,6 +2187,60 @@
     var nameEl = titleRow.querySelector('.guild-info__basic__name, .top_title_name');
     if (nameEl) titleRow.insertBefore(slot, nameEl.nextSibling);   // 名字右边
     else titleRow.appendChild(slot);
+  }
+
+  // ---------- 未登录时页面提示（导航固定显示五项，缺登录态的页面显示「无法查看」） ----------
+  // 官方内容页（探索发现 / 频道主页 / 帖子详情）按「腾讯频道网页登录」渲染；
+  // 频道动态页的数据来自「频道账号（CLI）」。缺哪个就提示哪个，并给一个去登录的入口。
+  function pageLoginNeed() {
+    var tail = routeKey();
+    if (!tail || tail === 'explore' || tail.indexOf('g/') === 0) return 'web';
+    if (tail.indexOf('index') === 0) return 'cli';
+    return '';
+  }
+  var _noticeMissing = '';
+  function ensureLoginNotice() {
+    var need = pageLoginNeed();
+    var missing = '';
+    if (need === 'web' && !TXPD_WEB_LOGGED_IN) missing = '腾讯频道网页未登录';
+    else if (need === 'cli' && _cliLoggedIn === false) missing = '频道账号（CLI）未登录';
+    var box = document.querySelector('.txpd-login-notice');
+    var explore = document.getElementById('explorePage');
+    var dyn = document.querySelector('.txpd-dynamic');
+    var guildMain = document.querySelector('.game-guild-main');
+    if (_pageOpen) {
+      if (box && box.parentNode) box.parentNode.removeChild(box);
+      _noticeMissing = '';
+      return;   // 整页视图开着：提示让位（内容显隐由视图层管）
+    }
+    if (!missing) {
+      if (box && box.parentNode) box.parentNode.removeChild(box);
+      _noticeMissing = '';
+      if (guildMain) guildMain.style.display = '';
+      return;
+    }
+    if (explore) explore.style.display = 'none';
+    if (dyn) dyn.style.display = 'none';
+    if (guildMain) guildMain.style.display = 'none';
+    if (!box) {
+      box = el('div', { 'class': 'app-page txpd-login-notice' });
+      box.appendChild(el('div', { 'class': 'txpd-mg-card txpd-notice-card' }));
+      var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main') || document.body;
+      host.appendChild(box);
+    }
+    if (_noticeMissing !== missing) {
+      _noticeMissing = missing;
+      var card = box.firstChild;
+      card.innerHTML = '';
+      card.appendChild(el('h3', null, missing + '，无法查看'));
+      card.appendChild(el('p', { 'class': 'txpd-mg-desc' }, need === 'web'
+        ? '这个页面的内容按腾讯频道网页登录态渲染。到「插件管理 → 网页登录」扫码登录后即可查看；'
+          + '登录只影响显示，点赞 / 评论 / 发帖等操作始终由频道账号（CLI）完成。'
+        : '这个页面的数据来自插件账号（CLI）。到「插件管理 → 频道账号」登录后即可查看。'));
+      var btn = mgBtn('去登录', true);
+      btn.addEventListener('click', openManagePage);
+      card.appendChild(btn);
+    }
   }
 
   // ---------- 手机端返回按钮：版块流/帖子详情等深视图提供退出出口 ----------
@@ -2019,60 +2321,89 @@
   function navIcon(href) {
     return svgIcon(href, 24);
   }
-  // 官方侧栏里要删掉的入口：管理中心是官方频道主的运维台，镜像页里点进去也是死链
-  var OFFICIAL_NAV_HIDE = ['管理中心'];
-  // 官方自己就有的「动态」（镜像是复刻官方前端）：插件不再重复插一条
-  var NAV_DYN_LABELS = ['动态', '频道动态'];
-  var TXPD_NAV_CLASSES = ['txpd-nav-dynamic', 'txpd-nav-schedule', 'txpd-nav-dm', 'txpd-nav-admin'];
+  // 主页导航**固定五项**（顺序固定，不随登录态变化）：
+  // 频道动态 / 探索发现 / 定时发帖 / 私信列表 / 插件管理
+  // 只隐藏官方多余的入口（管理中心等），绝不删官方节点：那些是 Vue 托管的，
+  // 删掉会让水合/重渲染时 insertBefore 找不到参照节点。
+  var NAV_FIXED = [
+    { key: 'dynamic', label: '频道动态', icon: 'assets/nav.svg#home', go: function () { spaNavigate('index'); } },
+    { key: 'explore', label: '探索发现', icon: 'assets/nav.svg#compass', go: function () { spaNavigate('explore'); } },
+    { key: 'schedule', label: '定时发帖', icon: 'assets/common.svg#setting', go: function () { openPage('schedule'); } },
+    { key: 'dm', label: '私信列表', icon: 'assets/nav.svg#discuss', go: function () { openPage('dm'); } },
+    { key: 'admin', label: '插件管理', icon: 'assets/nav.svg#manage', go: openManagePage },
+  ];
+  var TXPD_NAV_CLASSES = ['txpd-nav-dynamic', 'txpd-nav-explore', 'txpd-nav-schedule', 'txpd-nav-dm', 'txpd-nav-admin'];
 
   function navItemText(it) {
     return ((it.textContent || '').trim());
   }
-  function isOfficialNavItem(it) {
+  function isTxpdNavItem(it) {
     for (var i = 0; i < TXPD_NAV_CLASSES.length; i++) {
-      if (it.classList && it.classList.contains(TXPD_NAV_CLASSES[i])) return false;
+      if (it.classList && it.classList.contains(TXPD_NAV_CLASSES[i])) return true;
     }
-    return true;
+    return false;
+  }
+
+  function mkNavItem(slot) {
+    var a = el('a', { 'class': 'menu-item txpd-nav-' + slot.key, title: slot.label });
+    a.style.cssText = 'cursor:pointer;';
+    a.setAttribute('data-txpd-nav', slot.key);
+    a.appendChild(navIcon(slot.icon));
+    a.appendChild(el('span', { 'class': 'item-text' }, slot.label));
+    a.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      slot.go();
+    });
+    return a;
   }
 
   function ensureNavEntries() {
     var nav = document.querySelector('.app-menu-list');
     if (!nav) return;
-    var items = Array.prototype.slice.call(nav.querySelectorAll('.menu-item'));
-    // 1) 删掉指定的官方入口（每次同步都做：应用重渲染会把它们加回来）
-    items.forEach(function (it) {
-      if (isOfficialNavItem(it) && OFFICIAL_NAV_HIDE.indexOf(navItemText(it)) !== -1 && it.parentNode) {
-        it.parentNode.removeChild(it);
-      }
+    var official = Array.prototype.slice.call(nav.querySelectorAll('.menu-item')).filter(function (it) {
+      return !isTxpdNavItem(it);
     });
-    // 2) 官方已经有「动态」→ 插件那条不再重复插（已插过就撤掉），避免侧栏出现两个动态
-    var officialDyn = items.some(function (it) {
-      if (!isOfficialNavItem(it)) return false;
-      if (NAV_DYN_LABELS.indexOf(navItemText(it)) !== -1) return true;
+    // 官方那条「探索发现」直接留用（原生外观与选中态），其余官方入口一律隐藏
+    var officialExplore = null;
+    official.forEach(function (it) {
+      var t = navItemText(it);
       var href = it.getAttribute('href') || '';
-      return /(^|\/)index(\/|$|\?|#)/.test(href);
+      if (!officialExplore && (t === '探索发现' || t.indexOf('探索') === 0) && href.indexOf('/explore') !== -1) officialExplore = it;
     });
-    var mineDyn = nav.querySelector('.txpd-nav-dynamic');
-    if (officialDyn) {
-      if (mineDyn && mineDyn.parentNode) mineDyn.parentNode.removeChild(mineDyn);
-    }
-    if (nav.querySelector('.txpd-nav-dm')) return;
-    var mk = function (cls, title, iconHref, label, onClick) {
-      var a = el('a', { 'class': 'menu-item ' + cls, title: title });
-      a.style.cssText = 'cursor:pointer;';
-      a.appendChild(navIcon(iconHref));
-      a.appendChild(el('span', { 'class': 'item-text' }, label));
-      a.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); onClick(); });
-      return a;
-    };
-    if (!officialDyn) {
-      var dynEntry = mk('txpd-nav-dynamic', '动态', 'assets/nav.svg#home', '动态', function () { spaNavigate('index'); });
-      var firstItem = nav.querySelector('.menu-item');
-      if (firstItem) nav.insertBefore(dynEntry, firstItem); else nav.appendChild(dynEntry);
-    }
-    nav.appendChild(mk('txpd-nav-schedule', '定时发帖', 'assets/common.svg#setting', '定时发帖', function () { openScheduleDialog(null); }));
-    nav.appendChild(mk('txpd-nav-dm', '私信列表', 'assets/nav.svg#discuss', '私信列表', openDmList));
-    nav.appendChild(mk('txpd-nav-admin', '插件管理', 'assets/nav.svg#manage', '插件管理', openManagePage));
+    official.forEach(function (it) {
+      if (it === officialExplore) return;
+      it.style.display = 'none';
+      it.style.pointerEvents = 'none';
+      it.setAttribute('data-txpd-hidden', '1');
+    });
+    // 按固定顺序摆放（同父节点内重排，安全）
+    var cursor = null;
+    var used = [];
+    NAV_FIXED.forEach(function (slot) {
+      var node;
+      if (slot.key === 'explore' && officialExplore) {
+        node = officialExplore;
+      } else {
+        node = nav.querySelector('.txpd-nav-' + slot.key);
+      }
+      if (!node) {
+        node = mkNavItem(slot);
+        if (cursor && cursor.parentNode === nav) nav.insertBefore(node, cursor.nextSibling);
+        else nav.insertBefore(node, nav.firstElementChild);
+      } else if (cursor ? node.previousElementSibling !== cursor : nav.firstElementChild !== node) {
+        if (cursor && cursor.parentNode === nav) nav.insertBefore(node, cursor.nextSibling);
+        else nav.insertBefore(node, nav.firstElementChild);
+      }
+      used.push(node);
+      cursor = node;
+    });
+    // 清掉本次没用上的插件旧入口（自己的节点，可安全删除）：
+    // 例如官方「探索发现」出现后，插件早先自己插的那条要撤掉，否则会出现两个
+    Array.prototype.forEach.call(nav.querySelectorAll('.menu-item[class*="txpd-nav-"]'), function (it) {
+      if (used.indexOf(it) !== -1) return;
+      if (it.parentNode) it.parentNode.removeChild(it);
+    });
   }
 
   // ---------- 发帖修复：已加入频道隐藏「登录后…」+ 接管「发表」为 CLI ----------
@@ -4158,7 +4489,8 @@
       syncCommentPlaceholder();
       ensureGatedFallback();
       ensureDynamicPage();
-      ensureManagePage();     // 放在动态页之后：整页视图要能盖住动态页
+      ensurePageView();       // 放在动态页之后：整页视图要能盖住动态页
+      ensureLoginNotice();    // 缺登录态的页面显示「无法查看」提示
     }, 120);
   }
   function mount() {
@@ -4166,7 +4498,8 @@
     applyCachedAcctState();
     ensureJoinedSection();
     queueUiSync();
-    // 没有任何已登录的 CLI 账号 → 自动打开插件管理，引导先登录
+    // 页面提示需要 CLI 登录态；顺带在没有任何已登录账号时打开插件管理引导登录
+    getAccountsState().catch(function () { /* 忽略 */ });
     setTimeout(maybeAutoOpenManage, 1200);
     // 挂 window 捕获层：应用的全局守卫在 window 捕获里 stopPropagation 拦截点赞/评论点击
     // （document 层的监听收不到事件），同层后注册的监听仍可运行
@@ -4187,7 +4520,7 @@
         e.stopPropagation();
         var opKind = opBtn.getAttribute('data-txpd-op');
         if (opKind === 'config') openGuildConfig(opBtn);
-        else if (opKind === 'schedule') openScheduleDialog(currentGuild(), opBtn);
+        else if (opKind === 'schedule') openPage('schedule');
         else if (opKind === 'members') openMemberList(opBtn);
         else if (opKind === 'join') openJoinFlow(currentGuildNumber());
         return;
