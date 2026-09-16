@@ -1,0 +1,2 @@
+import{_ as o}from"./view-share-hs.W9PmeNR6.js";import{F as r,_ as t,H as e,a7 as m}from"./vue.DqBOZU7p.js";import"./common.Bv-qFV2J.js";import"./entry.B7UWswv3.js";import"./assets-chunk.C6U0AydF.js";import"./vendor.DZ-ggmNF.js";import"./gui.B1_3T7oE.js";import"./svg-icon.DIFNjPEf.js";import"./guild-common.qmmOQs6s.js";import"./vue-chunk.us5klnW3.js";import"./view-share-ai-search.fPVJ6brC.js";const B=r({__name:"[shareCode]",setup(p){return(a,i)=>(t(),e("div",null,[m(o)]))}});export{B as default};
+                                            

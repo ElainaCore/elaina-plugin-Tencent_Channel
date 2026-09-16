@@ -1,0 +1,28 @@
+# ---- 运行期数据 / 登录态（绝不提交）----
+users/
+users.json
+token_store.json
+keychain_owner.json
+.qqcli/
+.cli/
+.home/
+web/pd-cookie.txt
+admins.txt
+plugin_settings.json
+_joined_guilds.json
+uploads/
+data/
+feed_schedules.json
+post_history.json
+comment_notify_seen.json
+dm_notify_seen.json
+*.log
+__pycache__/
+*.pyc
+
+# ---- 开发脚手架（补丁脚本、抓包、内部文档）----
+.fetch/
+_devnotes/
+HANDOFF*.md
+MEMORY.md
+REPLICA_STATUS.md

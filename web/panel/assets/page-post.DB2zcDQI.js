@@ -1,0 +1,2 @@
+import{D as o}from"./view-post.BVKh6zLh.js";import{F as t,_ as p,$ as r}from"./vue.DqBOZU7p.js";import"./svg-icon.DIFNjPEf.js";import"./common.Bv-qFV2J.js";import"./vendor.DZ-ggmNF.js";import"./entry.B7UWswv3.js";import"./assets-chunk.C6U0AydF.js";import"./gui.B1_3T7oE.js";import"./guild-common.qmmOQs6s.js";import"./vue-chunk.us5klnW3.js";import"./view-share-ai-search.fPVJ6brC.js";import"./feed-editor.VKPpiO5t.js";const y=t({__name:"[pid]",setup(m){return(e,i)=>(p(),r(o,{"show-type":"page"}))}});export{y as default};
+                                              
