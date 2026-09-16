@@ -505,6 +505,15 @@
     '.txpd-mg-qr img{width:168px;height:168px;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;background:#fff;}',
     '.txpd-mg-qr-tip{margin-top:8px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
     '.txpd-mg-textarea{width:100%;min-height:110px;box-sizing:border-box;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;padding:10px 12px;font-size:13px;font-family:inherit;line-height:1.6;resize:vertical;color:var(--text-primary,#222);background:var(--bg-middle-light,#fff);}',
+    // 主页导航固定为这五项：官方导航项一律纯样式隐藏（首帧即生效，之后不动 DOM），
+    // 插件自己那五项带 data-txpd-nav，不受这条影响
+    '.aside-group--nav .app-menu-list > .menu-item:not([data-txpd-nav]){display:none!important;}',
+    // 插件自己插的导航项高亮（拿不到官方的 router-link-active）
+    '.app-menu-list .menu-item.txpd-nav-active{background:var(--overlay-active,rgba(0,0,0,.06));font-weight:600;}',
+    // 新建定时计划的表单：一行两个设置
+    '.txpd-sched-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;}',
+    '@media (max-width:560px){.txpd-sched-form{grid-template-columns:1fr;}}',
+    '.txpd-sched-form select,.txpd-sched-form input{width:100%;box-sizing:border-box;}',
     // 定时计划条目
     '.txpd-sched-item{border-top:1px solid var(--border-primary,rgba(219,220,224,.6));padding:12px 0;}',
     '.txpd-sched-item:first-child{border-top:none;padding-top:2px;}',
@@ -515,6 +524,26 @@
     '.txpd-sched-cron{font-size:12px;color:var(--text-link,#2b64f5);}',
     '.txpd-sched-meta{margin-top:4px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
     '.txpd-sched-body{margin-top:4px;font-size:13px;color:var(--text-primary,#333);line-height:1.6;word-break:break-word;}',
+    // ---------- 交互顺滑化：过渡/进入动画（尊重系统「减少动态效果」）----------
+    '.txpd-mg-btn,.txpd-join-btn,.txpd-cli-more,.app-menu-list .menu-item{transition:background-color .16s ease,opacity .16s ease,transform .12s ease,color .16s ease;}',
+    '.txpd-mg-btn:active,.txpd-join-btn:active,.txpd-cli-more:active{transform:scale(.97);}',
+    '.txpd-mg-card,.txpd-sched-item{transition:box-shadow .2s ease,border-color .2s ease;}',
+    '.txpd-mg-card:hover{border-color:rgba(43,100,245,.35);}',
+    '@keyframes txpd-fade-up{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}',
+    '@keyframes txpd-fade-in{from{opacity:0;}to{opacity:1;}}',
+    '@keyframes txpd-slide-left{from{opacity:0;transform:translateX(24px);}to{opacity:1;transform:none;}}',
+    '@keyframes txpd-pop{from{opacity:0;transform:translateY(8px) scale(.985);}to{opacity:1;transform:none;}}',
+    '.txpd-manage{animation:txpd-fade-up .22s cubic-bezier(.2,.8,.25,1);}',
+    '#txpd-drawer{animation:txpd-slide-left .22s cubic-bezier(.2,.8,.25,1);}',
+    '#txpd-acct-mask{animation:txpd-fade-in .16s ease;}',
+    '#txpd-acct-dlg{animation:txpd-pop .2s cubic-bezier(.2,.8,.25,1);}',
+    '#txpd-cli-panel,#txpd-cli-body>*{animation:txpd-fade-in .2s ease;}',
+    '#txpd-cli-body .txpd-cli-grid>*{animation:txpd-fade-up .24s ease both;}',
+    '.txpd-dynamic .feed-list-item,.txpd-dyn-list>*{animation:txpd-fade-up .22s ease both;}',
+    '@media (prefers-reduced-motion: reduce){'
+    + '.txpd-manage,#txpd-drawer,#txpd-acct-mask,#txpd-acct-dlg,#txpd-cli-panel,#txpd-cli-body>*{animation:none!important;}'
+    + '.txpd-mg-btn,.txpd-join-btn,.txpd-cli-more,.app-menu-list .menu-item{transition:none!important;}'
+    + '}',
     // 缺登录态时的整页提示
     '.txpd-login-notice{display:flex;align-items:flex-start;justify-content:center;height:100%;padding:64px 22px 0;box-sizing:border-box;}',
     '.txpd-notice-card{max-width:520px;width:100%;}',
@@ -719,6 +748,7 @@
       ensureNarrowDrawer();
       loadJoinedGuilds().then(function () {
         syncTempGuildSection();
+        syncMyGuildDuplicates();
         syncGuildViewJoinBtn();
         moveChannelList();
         ensureTopbarButtons();
@@ -943,18 +973,44 @@
     var gid = m ? m[1] : '';
     var nameEl = item.querySelector('.item-name');
     var name = nameEl ? nameEl.textContent.trim() : '';
+    if (!item.getAttribute('data-txpd-gnum') && name) item.setAttribute('data-txpd-gnum', name);
     var cls = (item.className || '').toString();
     var expanded = cls.indexOf('router-link-active') !== -1 || !!item.querySelector('.router-link-active') || (item.innerText || '').indexOf('展开全部') !== -1;
     var num = currentGuildNumber();
     var currentIsJoined = !!(num && _joinedKeys && _joinedKeys[num]);
     var off = officialMemberKeys();
     var officialJoined = !!((gid && off.gids[gid]) || (name && off.names[name]));
-    if (officialJoined || (gid && _joinedKeys && _joinedKeys[gid]) || (name && _joinedNames && _joinedNames[name]) || (expanded && currentIsJoined)) {
+    var numHit = numVariants(item.getAttribute('data-txpd-gnum') || gid).some(function (k) { return _joinedKeys && _joinedKeys[k]; });
+    if (officialJoined || numHit || (gid && _joinedKeys && _joinedKeys[gid]) || (name && _joinedNames && _joinedNames[name]) || (expanded && currentIsJoined)) {
       item.style.display = 'none';
       return true;
     }
     return false;
   }
+  // 官方「我的频道」（按网页登录态）与插件「已加入的频道」（按 CLI 账号）重复时，只显示在「已加入的频道」。
+  // 只改 display，不删不动官方节点（Vue 托管）。
+  function syncMyGuildDuplicates() {
+    var group = document.querySelector('.aside-group--my-guild');
+    if (!group) return;
+    Array.prototype.forEach.call(group.querySelectorAll('.my-guild-item'), function (it) {
+      var img = it.querySelector('img.item-avatar') || it.querySelector('img');
+      var m = img ? /groupprohead\.gtimg\.cn\/(\d+)/.exec(img.getAttribute('src') || '') : null;
+      var gid = m ? m[1] : '';
+      var nameEl = it.querySelector('.item-name');
+      var name = nameEl ? (nameEl.textContent || '').trim() : '';
+      var dup = !!((gid && _joinedKeys && _joinedKeys[gid])
+        || (name && _joinedNames && _joinedNames[name])
+        || numVariants(gid || name).some(function (k) { return _joinedKeys && _joinedKeys[k]; }));
+      if (dup) {
+        it.style.display = 'none';
+        it.setAttribute('data-txpd-dup', '1');
+      } else if (it.getAttribute('data-txpd-dup')) {
+        it.style.removeProperty('display');
+        it.removeAttribute('data-txpd-dup');
+      }
+    });
+  }
+
   function syncTempGuildSection() {
     if (!_joinedKeys) return;
     var group = document.querySelector('.aside-group--my-temp-guild');
@@ -1095,12 +1151,45 @@
 
   function guildCacheKey() { return 'txpd_joined_guilds_v1_' + (TXPD_USER || 'default'); }
 
+  // 频道号的两种形态：地址栏里是 base64（如 scz8r23h27），接口/CLI 里常是纯数字。
+  // 两者互为编码，比较前统一展开成「原样 + 数字」两个键，避免同一频道被判成未加入。
+  function numVariants(v) {
+    var out = [];
+    var raw = String(v == null ? '' : v).trim();
+    if (!raw) return out;
+    out.push(raw);
+    // base64 → 数字（去掉 -_ 补齐与空白）
+    try {
+      var b = raw.replace(/-/g, '+').replace(/_/g, '/');
+      while (b.length % 4) b += '=';
+      var txt = atob(b);
+      var digits = txt.replace(/[^0-9]/g, '');
+      if (digits && digits.length >= 6) out.push(digits);
+    } catch (e) { /* 不是 base64 就跳过 */ }
+    // 纯数字 → base64
+    if (/^\d{6,}$/.test(raw)) {
+      try {
+        out.push(btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+      } catch (e) { /* 忽略 */ }
+    }
+    return out.filter(function (x, i, a) { return x && a.indexOf(x) === i; });
+  }
+
+  // 页面顶部标题栏里的频道名（频道号两套编码对不上时，用它兜底认频道）
+  function pageGuildName() {
+    var el1 = document.querySelector('.guild-info__basic__name') || document.querySelector('.top_title_name') ||
+      document.querySelector('.guild-web-main-title-bar .guild-info__basic__name') ||
+      document.querySelector('.game-guild-main__not-permit__name');
+    var t = el1 ? (el1.textContent || '').trim() : '';
+    return t.replace(/频道$/, '').trim();
+  }
+
   function setJoinedCache(guilds) {
     _guildsCache = guilds;
     _joinedKeys = {};
     _joinedNames = {};
     guilds.forEach(function (g) {
-      if (g.guild_number) _joinedKeys[g.guild_number] = 1;
+      numVariants(g.guild_number).forEach(function (k) { _joinedKeys[k] = 1; });
       if (g.guild_id) _joinedKeys[g.guild_id] = 1;
       if (g.name) _joinedNames[g.name.trim()] = 1;
     });
@@ -1286,8 +1375,19 @@
     var num = currentGuildNumber();
     var g = null;
     if (num && _guildsCache) {
+      var want = numVariants(num);
       for (var i = 0; i < _guildsCache.length; i++) {
-        if (_guildsCache[i].guild_number === num) { g = _guildsCache[i]; break; }
+        var gi = numVariants(_guildsCache[i].guild_number);
+        if (gi.some(function (x) { return want.indexOf(x) !== -1; })) { g = _guildsCache[i]; break; }
+      }
+      if (!g) {
+        // 兜底：按频道名认（频道号存在多种编码形态，地址栏里的那个不一定能对上接口返回的）
+        var pn = pageGuildName();
+        if (pn) {
+          for (var j = 0; j < _guildsCache.length; j++) {
+            if (String(_guildsCache[j].name || '').trim().replace(/频道$/, '').trim() === pn) { g = _guildsCache[j]; break; }
+          }
+        }
       }
     }
     return { num: num, g: g, id: g ? g.guild_id : '' };
@@ -1416,8 +1516,8 @@
     var schedImages = [];
     var imgBox = el('div', { style: 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;' });
     var imgPicker = setupImagePicker(imgBox, schedImages);
-    // 2 列网格
-    var grid = el('div', { style: 'display:grid;grid-template-columns:1fr;gap:8px 12px;' });
+    // 两列栅格：一行放两个设置，内容/图片占满整行（窄屏自动回落一列）
+    var grid = el('div', { 'class': 'txpd-sched-form' });
     grid.appendChild(fieldRow('频道', gSel));
     grid.appendChild(fieldRow('版块', cSel));
     grid.appendChild(fieldRow('计划名称', nameInput));
@@ -1427,8 +1527,12 @@
     var cronRow = fieldRow('Cron 表达式', cronInput); cronRow.style.display = 'none'; grid.appendChild(cronRow);
     grid.appendChild(fieldRow('标题', titleInput));
     grid.appendChild(fieldRow('格式', fmtSel));
-    grid.appendChild(fieldRow('内容', contentInput));
-    grid.appendChild(fieldRow('图片（可选）', imgBox));
+    var contentRow = fieldRow('内容', contentInput);
+    contentRow.style.gridColumn = '1 / -1';
+    grid.appendChild(contentRow);
+    var imgRow = fieldRow('图片（可选）', imgBox);
+    imgRow.style.gridColumn = '1 / -1';
+    grid.appendChild(imgRow);
     dlgP.appendChild(grid);
     var send = primaryBtn('保存计划');
     send.style.width = '100%';
@@ -1784,8 +1888,8 @@
     page.appendChild(card2);
 
     // ③ 插件管理员
-    var card3 = mgCard('插件管理员', '一行一个 QQ 号；留空并保存即清空。');
-    var ta = el('textarea', { 'class': 'txpd-mg-textarea', placeholder: '管理员 QQ 号（每行一个）' });
+    var card3 = mgCard('插件管理员', '一行一个 openid；留空并保存即清空。');
+    var ta = el('textarea', { 'class': 'txpd-mg-textarea', placeholder: '管理员 openid（每行一个）' });
     var row3 = el('div', { 'class': 'txpd-mg-row', style: 'margin-top:10px;' });
     var save = mgBtn('保存', true);
     var st3 = el('span', { 'class': 'txpd-mg-status' }, '');
@@ -1949,6 +2053,10 @@
     _schedTs = now;
     api('/schedules').then(function (r) {
       var list = (r && r.data && r.data.schedules) || [];
+      // 数据没变就不重建 DOM：避免每 3 秒闪一次、把滚动位置顶回去
+      var sig = JSON.stringify(list);
+      if (sig === box._sig) return;
+      box._sig = sig;
       box.innerHTML = '';
       if (!list.length) {
         box.appendChild(el('div', { 'class': 'txpd-mg-status' }, '暂无定时计划，点右上角「+ 新建计划」添加'));
@@ -2061,6 +2169,9 @@
       if (!byPeer[key]) byPeer[key] = { nick: h.nick, tiny: h.tiny, last: h.text, ts: h.ts };
     });
     var keys = Object.keys(byPeer);
+    var sig = JSON.stringify(byPeer);
+    if (sig === box._sig) return;   // 没变化就不重建（防闪烁、防滚动位置被顶回）
+    box._sig = sig;
     box.innerHTML = '';
     if (!keys.length) {
       box.appendChild(el('div', { 'class': 'txpd-mg-status' }, '暂无私信记录（从成员列表点击成员名字可发起私信）'));
@@ -2361,48 +2472,39 @@
   function ensureNavEntries() {
     var nav = document.querySelector('.app-menu-list');
     if (!nav) return;
-    var official = Array.prototype.slice.call(nav.querySelectorAll('.menu-item')).filter(function (it) {
-      return !isTxpdNavItem(it);
-    });
-    // 官方那条「探索发现」直接留用（原生外观与选中态），其余官方入口一律隐藏
-    var officialExplore = null;
-    official.forEach(function (it) {
-      var t = navItemText(it);
-      var href = it.getAttribute('href') || '';
-      if (!officialExplore && (t === '探索发现' || t.indexOf('探索') === 0) && href.indexOf('/explore') !== -1) officialExplore = it;
-    });
-    official.forEach(function (it) {
-      if (it === officialExplore) return;
-      it.style.display = 'none';
-      it.style.pointerEvents = 'none';
-      it.setAttribute('data-txpd-hidden', '1');
-    });
-    // 按固定顺序摆放（同父节点内重排，安全）
-    var cursor = null;
-    var used = [];
+    // 五项只插一次，之后不再有任何 DOM 变动：
+    // - 官方导航项由 CSS 隐藏（不删不挪，避免破坏 Vue 水合）；
+    // - 顺序按 NAV_FIXED 追加到末尾，插完即为最终状态。
+    var mine = {};
     NAV_FIXED.forEach(function (slot) {
-      var node;
-      if (slot.key === 'explore' && officialExplore) {
-        node = officialExplore;
-      } else {
-        node = nav.querySelector('.txpd-nav-' + slot.key);
-      }
+      var node = nav.querySelector('.txpd-nav-' + slot.key);
       if (!node) {
         node = mkNavItem(slot);
-        if (cursor && cursor.parentNode === nav) nav.insertBefore(node, cursor.nextSibling);
-        else nav.insertBefore(node, nav.firstElementChild);
-      } else if (cursor ? node.previousElementSibling !== cursor : nav.firstElementChild !== node) {
-        if (cursor && cursor.parentNode === nav) nav.insertBefore(node, cursor.nextSibling);
-        else nav.insertBefore(node, nav.firstElementChild);
+        nav.appendChild(node);
       }
-      used.push(node);
-      cursor = node;
+      mine[slot.key] = node;
+      if (!node.getAttribute('data-txpd-wired')) {
+        node.setAttribute('data-txpd-wired', '1');
+        node.addEventListener('click', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          slot.go();
+        });
+      }
     });
-    // 清掉本次没用上的插件旧入口（自己的节点，可安全删除）：
-    // 例如官方「探索发现」出现后，插件早先自己插的那条要撤掉，否则会出现两个
-    Array.prototype.forEach.call(nav.querySelectorAll('.menu-item[class*="txpd-nav-"]'), function (it) {
-      if (used.indexOf(it) !== -1) return;
-      if (it.parentNode) it.parentNode.removeChild(it);
+    markNavActive(mine);
+  }
+
+  var _navActiveKey = '';
+  function markNavActive(mine) {
+    var tail = routeKey();
+    var cur = tail.indexOf('index') === 0 ? 'dynamic' : ((tail.indexOf('explore') === 0 || !tail) ? 'explore' : '');
+    if (cur === _navActiveKey) return;   // 路由没变就不写（避免 class 反复变动）
+    _navActiveKey = cur;
+    Object.keys(mine).forEach(function (k) {
+      if (!mine[k] || !mine[k].classList) return;
+      if (k === cur) mine[k].classList.add('txpd-nav-active');
+      else mine[k].classList.remove('txpd-nav-active');
     });
   }
 
@@ -2571,9 +2673,19 @@
   var _joinSettingTry = {};   // 频道号 -> 上次查询时间（8s 节流，避免卡死后再也不重试）
   function guildMetaIdentity(num) {
     if (_guildsCache && _guildsCache.length) {
+      var want = numVariants(num);
       for (var i = 0; i < _guildsCache.length; i++) {
-        if (_guildsCache[i].guild_number === num) {
+        var gi = numVariants(_guildsCache[i].guild_number);
+        if (gi.some(function (x) { return want.indexOf(x) !== -1; })) {
           return { role: _guildsCache[i].role || '成员', gid: _guildsCache[i].guild_id || '', known: true };
+        }
+      }
+      var pn = pageGuildName();
+      if (pn) {
+        for (var j = 0; j < _guildsCache.length; j++) {
+          if (String(_guildsCache[j].name || '').trim().replace(/频道$/, '').trim() === pn) {
+            return { role: _guildsCache[j].role || '成员', gid: _guildsCache[j].guild_id || '', known: true };
+          }
         }
       }
       return { role: '未加入', gid: '', known: true };

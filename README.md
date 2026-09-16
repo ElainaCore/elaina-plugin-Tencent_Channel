@@ -28,7 +28,7 @@ CLI 账号完成 —— 浏览器端不需要登录腾讯频道。面板里另�
 
 | 项 | 位置 | 说明 |
 |---|---|---|
-| 插件管理员 | 面板「插件管理」页（或 `data/admins.txt`，一行一个 ID） | 不内置默认管理员，未配置时指令会提示 |
+| 插件管理员 | 面板「插件管理」页（或 `data/admins.txt`，一行一个 openid） | 不内置默认管理员，未配置时指令会提示 |
 | 频道账号（CLI） | 面板「插件管理」页 → 登录 / 切换账号 扫码 | 发帖、评论、点赞、私信等**操作**都由它完成；可建多个槽位 |
 | 网页登录（显示用） | 面板「插件管理」页 → 获取登录二维码 | 复刻官方扫码登录，**只影响页面按登录态显示内容**；只允许登录一个，Cookie 存在 `data/pd-cookie.txt`（也可手动放这个文件） |
 
@@ -165,7 +165,7 @@ web/
   panel/assets/              镜像的官方静态资源 + txpd-inject.js（站点适配脚本）
   panel/_feed_tpl.json       受限频道 feeds 响应的结构模板（无任何真实数据）
 data/                        运行期数据（不入库，备份/迁移只需搬这一个目录）
-  admins.txt                 插件管理员（一行一个 ID）
+  admins.txt                 插件管理员（一行一个 openid）
   users.json                 账号槽位列表与昵称
   users/<槽位>/              槽位 HOME：.qqcli 登录态、token_store.json、pd-cookie.txt、登录二维码
   pd-cookie.txt              全局 pd.qq.com 网页 Cookie（可选）

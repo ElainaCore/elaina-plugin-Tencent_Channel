@@ -323,7 +323,7 @@ def admin_handler(pattern: str, **kwargs):
                 if not _admins_configured():
                     try:
                         await event.reply(
-                            "⚠️ 尚未配置插件管理员，请先在 data/admins.txt 或 Web 面板「插件管理员」页填入管理员ID。\n"
+                            "⚠️ 尚未配置插件管理员，请先在 data/admins.txt 或 Web 面板「插件管理员」页填入管理员 openid。\n"
                             f"你的ID：{uid or '未知'}"
                         )
                     except Exception:
