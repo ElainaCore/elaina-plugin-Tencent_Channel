@@ -112,7 +112,7 @@ KEYCHAIN_GLOBAL = IS_WINDOWS or sys.platform == "darwin"
 KEYCHAIN_OWNER_FILE = BASE_DIR / "keychain_owner.json"
 _KEYCHAIN_LOCK = threading.Lock()
 ADMINS_FILE = BASE_DIR / "admins.txt"
-DEFAULT_ADMINS = ["538389445D765D2988BFE31506C54799"]
+# 插件不内置默认管理员：admins.txt 没有内容（或文件不存在）即视为未配置，指令会提示去填自己的 ID。
 USERS_DIR = BASE_DIR / "users"
 USERS_FILE = BASE_DIR / "users.json"
 
@@ -262,46 +262,31 @@ def _migrate_legacy_login(user: str) -> None:
 
 
 def _load_admins() -> List[str]:
-    """读取插件管理员列表（一行一个，# 开头为注释），文件不存在时用默认管理员初始化。"""
+    """读取插件管理员列表（一行一个，# 开头为注释）；没有配置就是空列表，不写任何默认值。"""
     try:
-        if not ADMINS_FILE.exists():
-            ADMINS_FILE.write_text("\n".join(DEFAULT_ADMINS) + "\n", encoding="utf-8")
-        lines = ADMINS_FILE.read_text(encoding="utf-8").splitlines()
-        admins = [
-            x.strip() for x in lines if x.strip() and not x.strip().startswith("#")
-        ]
-        return admins or list(DEFAULT_ADMINS)
-    except Exception:
-        return list(DEFAULT_ADMINS)
+        text = ADMINS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [x.strip() for x in text.splitlines() if x.strip() and not x.strip().startswith("#")]
 
 
 def _save_admins(admins: List[str]) -> bool:
+    """保存管理员列表；允许保存为空（等于清空，指令会提示去配置）。"""
     cleaned: List[str] = []
     for item in admins:
         value = str(item or "").strip()
         if value and value not in cleaned:
             cleaned.append(value)
-    if not cleaned:
-        return False
     try:
-        ADMINS_FILE.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+        ADMINS_FILE.write_text(("\n".join(cleaned) + "\n") if cleaned else "", encoding="utf-8")
         return True
     except Exception:
         return False
 
 
 def _admins_configured() -> bool:
-    """admins.txt 是否已填入自己的管理员（仅有内置默认值视为未配置）。"""
-    try:
-        if not ADMINS_FILE.exists():
-            return False
-        lines = ADMINS_FILE.read_text(encoding="utf-8").splitlines()
-        admins = [
-            x.strip() for x in lines if x.strip() and not x.strip().startswith("#")
-        ]
-        return bool(admins) and admins != DEFAULT_ADMINS
-    except Exception:
-        return False
+    """admins.txt 是否已填入自己的管理员（空文件 / 只剩注释视为未配置）。"""
+    return bool(_load_admins())
 
 
 def _is_plugin_admin(user_id: Any) -> bool:

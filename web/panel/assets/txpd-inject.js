@@ -58,10 +58,19 @@
             var v = p.slice(i + 1);
             return v !== 'undefined' && v !== 'null' && v !== '';
           });
-          var virtual = Object.keys(VIRTUAL_COOKIES).map(function (k) {
-            return k + '=' + VIRTUAL_COOKIES[k];
+          var virtual = Object.keys(VIRTUAL_COOKIES).filter(function (k) {
+            // 与真实 Cookie 同口径：丢掉空值 / undefined / null（槽位 Cookie 文件里的残留值）
+            var v = String(VIRTUAL_COOKIES[k]).trim();
+            return k && v !== '' && v !== 'undefined' && v !== 'null';
+          }).map(function (k) {
+            // 值里出现 ; 或换行会把一个 cookie 拆成两段，解析器碰到空段就 trim 报错
+            return k + '=' + String(VIRTUAL_COOKIES[k]).replace(/[;\r\n]+/g, '');
           });
-          return virtual.concat(real).join('; ');
+          var out = virtual.concat(real).join('; ');
+          // 一个 cookie 都没有时必须给个占位：空串会被
+          // `.split(';').forEach(x => x.split('=')[1].trim())` 这类解析器判成 undefined 抛错
+          // （实测 static-res.qq.com 的统计脚本就是这样崩的），空串还会让解析结果全是脏键。
+          return out || 'txpd_noop=1';
         },
         set: function (v) { _origCookie.set.call(this, v); },
         configurable: true,
@@ -96,6 +105,49 @@
     var host = m[2].split(':')[0].toLowerCase();
     return host === 'qq.com' || (host.length > 7 && host.slice(-7) === '.qq.com');
   }
+
+  // 动态 script/iframe 的封锁必须在「插入之前」完成：MutationObserver 只是微任务，
+  // 事后移除时浏览器往往已经开始下载并执行（实测 static-res.qq.com 的统计脚本照样跑），
+  // 所以这里在 createElement / src 赋值阶段就把 qq 域地址拦掉——既不发请求也不执行。
+  // 拦截方式保持「不报错、不触发 onload/onerror」：app 的加载器是基于 promise 的，
+  // 若让它 reject，页面上会多出 Uncaught (in promise)。
+  function blockSrcProp(el) {
+    var proto = el.tagName === 'IFRAME' ? HTMLIFrameElement.prototype : HTMLScriptElement.prototype;
+    var desc = Object.getOwnPropertyDescriptor(proto, 'src');
+    if (!desc || !desc.get || !desc.set) return;
+    try {
+      Object.defineProperty(el, 'src', {
+        configurable: true,
+        enumerable: true,
+        get: function () { return desc.get.call(this); },
+        set: function (v) {
+          // 直接把地址吞掉：元素照旧可插入，但不会发起任何请求，也不会执行远端代码
+          if (isQqUrl(v)) { this.setAttribute('data-txpd-blocked', String(v)); return; }
+          desc.set.call(this, v);
+        },
+      });
+    } catch (e) { /* 个别环境无法重定义则退回 MutationObserver */ }
+  }
+  try {
+    var _createElement = document.createElement;
+    document.createElement = function (tag) {
+      var el = _createElement.apply(document, arguments);
+      try {
+        if (el && (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME')) blockSrcProp(el);
+      } catch (e) { /* 忽略 */ }
+      return el;
+    };
+    var _setAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      try {
+        if (String(name).toLowerCase() === 'src' && isQqUrl(value) && (this.tagName === 'SCRIPT' || this.tagName === 'IFRAME')) {
+          _setAttribute.call(this, 'data-txpd-blocked', String(value));
+          return;
+        }
+      } catch (e) { /* 忽略 */ }
+      return _setAttribute.call(this, name, value);
+    };
+  } catch (e) { /* 封锁失败不阻断主流程 */ }
 
   // pd.qq.com 站内链接（帖子 /g/xxx/post/yyy、频道 /g/xxx 等）改写为镜像相对路径，
   // 点击走本应用自己的路由（帖子详情/频道视图），不再跳去真实站点，也不算 qq 域请求
