@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.plugin.decorators import on_load, on_unload
 
 from ..commands.shared import (
-    BASE_DIR,
+    DATA_DIR,
     _extract_json,
     _get_self_user_id,
     _get_setting,
@@ -108,7 +108,7 @@ def _get_sender():
 
 
 def _seen_file(user: str) -> Path:
-    base = _user_home(user) if user else BASE_DIR
+    base = _user_home(user) if user else DATA_DIR
     return base / "comment_notify_seen.json"
 
 
@@ -947,7 +947,7 @@ async def _poll_dm_slot(user: str) -> None:
         return
     # check-notices 本身是增量接口（CLI 自己维护基线），返回的都是新通知；
     # 本地 seen 只做去重，不做首次基线吞掉。
-    seen_path = (_user_home(user) if user else BASE_DIR) / "dm_notify_seen.json"
+    seen_path = (_user_home(user) if user else DATA_DIR) / "dm_notify_seen.json"
     data = _read_json_file(seen_path, {})
     seen = (
         [str(x) for x in data.get("seen", [])]

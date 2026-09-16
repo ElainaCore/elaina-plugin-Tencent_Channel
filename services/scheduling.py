@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """定时发帖调度器：标准 5 段 Cron (分 时 日 月 周)，支持 * , - / 语法。
 
-计划任务存储在插件目录 feed_schedules.json，通过 Web 面板管理。
+计划任务存储在 data/feed_schedules.json，通过 Web 面板管理。
 内容支持纯文本 / Markdown / HTML（HTML 自动转换为 Markdown 后发布），
 可附带图片与视频（本地路径或 URL）。
 """
@@ -17,10 +17,10 @@ from typing import Any, Dict, List, Optional
 
 from core.plugin.decorators import on_load, on_unload
 
-from ..commands.shared import BASE_DIR, _extract_json, _normalize_rate_limit, _run_cli
+from ..commands.shared import DATA_DIR, _ensure_parent, _extract_json, _normalize_rate_limit, _run_cli
 
-SCHEDULES_FILE = BASE_DIR / "feed_schedules.json"
-HISTORY_FILE = BASE_DIR / "post_history.json"
+SCHEDULES_FILE = DATA_DIR / "feed_schedules.json"
+HISTORY_FILE = DATA_DIR / "post_history.json"
 HISTORY_MAX = 30
 
 CRON_EXAMPLES = [
@@ -228,6 +228,7 @@ def load_schedules() -> List[Dict[str, Any]]:
 
 
 def save_schedules(schedules: List[Dict[str, Any]]) -> bool:
+    _ensure_parent(SCHEDULES_FILE)
     try:
         SCHEDULES_FILE.write_text(
             json.dumps(schedules, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -277,6 +278,7 @@ def record_history(entry: Dict[str, Any]) -> None:
             != key
         ]
         history.insert(0, item)
+        _ensure_parent(HISTORY_FILE)
         HISTORY_FILE.write_text(
             json.dumps(history[:HISTORY_MAX], ensure_ascii=False, indent=2),
             encoding="utf-8",

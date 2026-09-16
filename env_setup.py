@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """环境自检：Linux/macOS 下自动补全 tencent-channel-cli。
 
-查找顺序：插件目录内置二进制（如 tencent-channel-cli-linux-x64）→ 插件目录
-本地 npm 安装（.cli）→ PATH。缺失时优先 npm 安装到插件目录（无需 root），
+查找顺序：插件目录内置二进制（如 tencent-channel-cli-linux-x64）→ data/.cli
+本地 npm 安装 → PATH。缺失时优先 npm 安装到 data/.cli（无需 root），
 失败再尝试 npm install -g。Windows 使用插件目录内置 tencent-channel-cli.exe，
 无需处理。
 """
@@ -14,10 +14,10 @@ import sys
 
 from core.plugin.decorators import on_load
 
-from .commands.shared import BASE_DIR, _cli_env, _resolve_cli
+from .commands.shared import BASE_DIR, DATA_DIR, _cli_env, _resolve_cli
 
 CLI_NAME = "tencent-channel-cli"
-LOCAL_PREFIX = BASE_DIR / ".cli"
+LOCAL_PREFIX = DATA_DIR / ".cli"
 NPM_INSTALL_TIMEOUT = 600
 
 
@@ -45,7 +45,7 @@ async def _npm_install_cli() -> None:
             f"请安装 Node.js/npm，或将 {CLI_NAME}-linux-x64 二进制放入插件目录 {BASE_DIR}"
         )
         return
-    print(f"[txpd] 检测到 {CLI_NAME} 缺失，正在安装到插件目录 {LOCAL_PREFIX} ...")
+    print(f"[txpd] 检测到 {CLI_NAME} 缺失，正在安装到 {LOCAL_PREFIX} ...")
     attempts = [
         ["install", "--prefix", str(LOCAL_PREFIX), CLI_NAME],
         ["install", "-g", CLI_NAME],

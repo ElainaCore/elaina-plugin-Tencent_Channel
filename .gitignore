@@ -1,4 +1,11 @@
 # ---- 运行期数据 / 登录态（绝不提交）----
+# 账号槽位与登录态、网页 Cookie、管理员、计划任务与历史、上传图片、本地 CLI 全在 data/ 下
+data/
+*.log
+__pycache__/
+*.pyc
+
+# 旧版本遗留在插件根目录的位置：升级后请把文件搬进 data/，这些路径同样不要提交
 users/
 users.json
 token_store.json
@@ -6,19 +13,15 @@ keychain_owner.json
 .qqcli/
 .cli/
 .home/
-web/pd-cookie.txt
 admins.txt
 plugin_settings.json
 _joined_guilds.json
 uploads/
-data/
 feed_schedules.json
 post_history.json
 comment_notify_seen.json
 dm_notify_seen.json
-*.log
-__pycache__/
-*.pyc
+web/pd-cookie.txt
 
 # ---- 开发脚手架（补丁脚本、抓包、内部文档）----
 .fetch/

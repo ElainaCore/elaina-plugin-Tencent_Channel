@@ -16,8 +16,11 @@ import shutil
 from core.plugin.decorators import handler
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# 运行期数据统一收在插件目录的 data/ 下：账号槽位与登录态、网页 Cookie、计划任务与历史、
+# 发帖上传的图片、npm 本地安装的 CLI 等都在这里；插件根目录只留代码与随包二进制。
+DATA_DIR = BASE_DIR / "data"
 IS_WINDOWS = sys.platform.startswith("win")
-LOCAL_NPM_DIR = BASE_DIR / ".cli" / "node_modules"
+LOCAL_NPM_DIR = DATA_DIR / ".cli" / "node_modules"
 LOCAL_CLI_BINS = (
     LOCAL_NPM_DIR / ".bin" / "tencent-channel-cli",
     LOCAL_NPM_DIR / "tencent-channel-cli-linux-x64" / "bin" / "tencent-channel-cli",
@@ -28,8 +31,8 @@ LOCAL_CLI_BINS = (
 
 def _cli_env(user: Optional[str] = None) -> Dict[str, str]:
     """CLI 子进程环境。多账号模式下每个账号槽位用独立的 HOME/USERPROFILE
-    （users/槽位名）隔离 ~/.qqcli 登录态；未创建任何槽位时保持原有行为：
-    Windows 用系统环境，Linux/macOS 在 HOME 缺失或不可写时回退到插件目录 .home。"""
+    （data/users/槽位名）隔离 ~/.qqcli 登录态；未创建任何槽位时保持原有行为：
+    Windows 用系统环境，Linux/macOS 在 HOME 缺失或不可写时回退到 data/.home。"""
     env = dict(os.environ)
     if not IS_WINDOWS:
         # 禁用系统钥匙串（secret service）：钥匙串是全局存储，不随 HOME 隔离，
@@ -52,7 +55,7 @@ def _cli_env(user: Optional[str] = None) -> Dict[str, str]:
         return env
     home = env.get("HOME", "")
     if not home or not os.path.isdir(home) or not os.access(home, os.W_OK):
-        fallback = BASE_DIR / ".home"
+        fallback = DATA_DIR / ".home"
         try:
             fallback.mkdir(exist_ok=True)
         except Exception:
@@ -71,7 +74,7 @@ def _ensure_executable(path: Path) -> None:
 
 def _resolve_cli() -> Optional[str]:
     """CLI 查找顺序：插件目录内置二进制（Windows: exe/cmd；Linux/macOS: linux-x64 等）
-    → 插件目录本地 npm 安装（.cli）→ PATH（npm install -g tencent-channel-cli）。"""
+    → data/.cli 本地 npm 安装 → PATH（npm install -g tencent-channel-cli）。"""
     if IS_WINDOWS:
         local_names = (
             "tencent-channel-cli.exe",
@@ -106,15 +109,26 @@ def _resolve_cli() -> Optional[str]:
     return None
 
 
-PLUGIN_SETTINGS = BASE_DIR / "plugin_settings.json"
-TOKEN_STORE = BASE_DIR / "token_store.json"
+PLUGIN_SETTINGS = DATA_DIR / "plugin_settings.json"
+TOKEN_STORE = DATA_DIR / "token_store.json"
 KEYCHAIN_GLOBAL = IS_WINDOWS or sys.platform == "darwin"
-KEYCHAIN_OWNER_FILE = BASE_DIR / "keychain_owner.json"
+KEYCHAIN_OWNER_FILE = DATA_DIR / "keychain_owner.json"
 _KEYCHAIN_LOCK = threading.Lock()
-ADMINS_FILE = BASE_DIR / "admins.txt"
-# 插件不内置默认管理员：admins.txt 没有内容（或文件不存在）即视为未配置，指令会提示去填自己的 ID。
-USERS_DIR = BASE_DIR / "users"
-USERS_FILE = BASE_DIR / "users.json"
+ADMINS_FILE = DATA_DIR / "admins.txt"
+# 插件不内置默认管理员：data/admins.txt 没有内容（或文件不存在）即视为未配置，指令会提示去填自己的 ID。
+USERS_DIR = DATA_DIR / "users"
+USERS_FILE = DATA_DIR / "users.json"
+UPLOADS_DIR = DATA_DIR / "uploads"              # 发帖插图落盘目录
+JOINED_GUILDS_FILE = DATA_DIR / "_joined_guilds.json"
+COOKIE_FILE = DATA_DIR / "pd-cookie.txt"        # pd.qq.com 网页 Cookie（可选，放进来自动带登录态）
+
+
+def _ensure_parent(path: Path) -> None:
+    """写文件前确保父目录存在（data/ 首次使用时按需创建）。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _safe_user_name(name: Any) -> str:
@@ -245,7 +259,7 @@ def _migrate_legacy_login(user: str) -> None:
                 os.environ.get("HOME", ""),
             ]
         else:
-            legacy_homes = [os.environ.get("HOME", ""), str(BASE_DIR / ".home")]
+            legacy_homes = [os.environ.get("HOME", ""), str(DATA_DIR / ".home")]
         for legacy in legacy_homes:
             src = Path(legacy) / ".qqcli" if legacy else None
             if src and src.is_dir():
@@ -277,6 +291,7 @@ def _save_admins(admins: List[str]) -> bool:
         value = str(item or "").strip()
         if value and value not in cleaned:
             cleaned.append(value)
+    _ensure_parent(ADMINS_FILE)
     try:
         ADMINS_FILE.write_text(("\n".join(cleaned) + "\n") if cleaned else "", encoding="utf-8")
         return True
@@ -285,7 +300,7 @@ def _save_admins(admins: List[str]) -> bool:
 
 
 def _admins_configured() -> bool:
-    """admins.txt 是否已填入自己的管理员（空文件 / 只剩注释视为未配置）。"""
+    """data/admins.txt 是否已填入自己的管理员（空文件 / 只剩注释视为未配置）。"""
     return bool(_load_admins())
 
 
@@ -297,7 +312,7 @@ def _is_plugin_admin(user_id: Any) -> bool:
 
 
 def admin_handler(pattern: str, **kwargs):
-    """同 @handler，但仅允许 admins.txt 中的插件管理员触发。"""
+    """同 @handler，但仅允许 data/admins.txt 中的插件管理员触发。"""
     kwargs.pop("owner_only", None)
 
     def decorator(func):
@@ -308,7 +323,7 @@ def admin_handler(pattern: str, **kwargs):
                 if not _admins_configured():
                     try:
                         await event.reply(
-                            "⚠️ 尚未配置插件管理员，请先在插件目录 admins.txt 或 Web 面板「插件管理员」页填入管理员ID。\n"
+                            "⚠️ 尚未配置插件管理员，请先在 data/admins.txt 或 Web 面板「插件管理员」页填入管理员ID。\n"
                             f"你的ID：{uid or '未知'}"
                         )
                     except Exception:
@@ -440,8 +455,8 @@ def _read_plugin_settings() -> Dict[str, Any]:
     data = _read_json_file(PLUGIN_SETTINGS, {})
     if data:
         return data
-    legacy_preview = _read_json_file(BASE_DIR / "preview_settings.json", {})
-    legacy_debug = _read_json_file(BASE_DIR / "debug_settings.json", {})
+    legacy_preview = _read_json_file(DATA_DIR / "preview_settings.json", {})
+    legacy_debug = _read_json_file(DATA_DIR / "debug_settings.json", {})
     merged = {
         "preview_enabled": bool(legacy_preview.get("__global__", True)),
         "debug_enabled": bool(legacy_debug.get("__global__", False)),
@@ -451,6 +466,7 @@ def _read_plugin_settings() -> Dict[str, Any]:
 
 
 def _write_json_file(path: Path, data: Dict[str, Any]) -> None:
+    _ensure_parent(path)
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

@@ -22,6 +22,7 @@
 import asyncio
 import base64
 import os
+import random
 import re
 import time
 import base64
@@ -48,7 +49,11 @@ from ..services.notifications import (
     notify_poll_interval,
 )
 from ..commands.shared import (
-    BASE_DIR,
+    COOKIE_FILE,
+    _ensure_parent,
+    JOINED_GUILDS_FILE,
+    UPLOADS_DIR,
+    USERS_DIR,
     _extract_json,
     _get_self_user_id,
     _load_admins,
@@ -82,8 +87,8 @@ _PROXY_COOKIES_TS = 0.0
 
 
 def _read_user_cookie_file(user: str) -> str:
-    """读取指定槽位的 pd.qq.com Cookie（镜像时保存的）。"""
-    base = BASE_DIR / "users" / _safe_user_name(user)
+    """读取指定槽位的 pd.qq.com Cookie（data/users/<槽位>/pd-cookie.txt 或全局 data/pd-cookie.txt）。"""
+    base = USERS_DIR / _safe_user_name(user)
     for name in ("pd-cookie.txt", ".qqcli/pd-cookie.txt"):
         f = base / name
         try:
@@ -91,10 +96,9 @@ def _read_user_cookie_file(user: str) -> str:
                 return f.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-    legacy = BASE_DIR / "web" / "pd-cookie.txt"
     try:
-        if legacy.is_file():
-            return legacy.read_text(encoding="utf-8").strip()
+        if COOKIE_FILE.is_file():
+            return COOKIE_FILE.read_text(encoding="utf-8").strip()
     except OSError:
         pass
     return ""
@@ -124,7 +128,7 @@ _joined_keys_cache: Dict[str, Any] = {"ts": 0.0, "numbers": set(), "ids": {}}
 _feeds_synth_cache: Dict[str, Any] = {}
 _FEEDS_SYNTH_TTL = 60.0
 _cli_lock = asyncio.Semaphore(2)      # CLI 调用限流（每次都要起进程，别并发太多）
-_JOINED_FILE = BASE_DIR / "_joined_guilds.json"
+_JOINED_FILE = JOINED_GUILDS_FILE
 
 
 def _load_joined_file() -> None:
@@ -837,7 +841,7 @@ _POLL_TASKS: Dict[str, asyncio.Task] = {}
 
 def _slot_has_token(user: str) -> bool:
     """快速判断槽位是否已登录（.qqcli/.env 里是否有 token，不启子进程）。"""
-    f = BASE_DIR / "users" / user / ".qqcli" / ".env"
+    f = USERS_DIR / user / ".qqcli" / ".env"
     try:
         return "QQ_AI_CONNECT_TOKEN" in f.read_text(encoding="utf-8")
     except OSError:
@@ -883,7 +887,7 @@ async def api_accounts_add(request: web.Request):
             if not ok:
                 return web.json_response({"success": False, "message": message})
     ok, output = await asyncio.to_thread(
-        _run_cli, ["login", "--json", "--qrcode-path", str(BASE_DIR / "users" / user / "login-qrcode.png")], None, user
+        _run_cli, ["login", "--json", "--qrcode-path", str(USERS_DIR / user / "login-qrcode.png")], None, user
     )
     data = _extract_json(output)
     payload = (data or {}).get("data") if isinstance(data, dict) else None
@@ -1022,7 +1026,7 @@ async def api_upload_image(request: web.Request):
     if len(blob) > 12 * 1024 * 1024:
         return web.json_response({"success": False, "message": "图片超过 12MB 限制"})
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
-    updir = BASE_DIR / "uploads"
+    updir = UPLOADS_DIR
     try:
         updir.mkdir(parents=True, exist_ok=True)
         out = updir / ("txpd_%d_%s" % (int(time.time() * 1000), safe))
@@ -1067,6 +1071,265 @@ async def _serve_panel_index(request: web.Request) -> web.Response:
             if end != -1:
                 body = body[:start] + body[end + len(b"</script>"):]
     return web.Response(body=body, content_type="text/html", charset="utf-8")
+
+
+# ==================== 网页登录（扫码；只影响页面显示，不参与点赞/评论等操作） ====================
+# 官方登录入口：xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=1600001587&daid=823（镜像页里抓到的原始参数）。
+# 流程全部在服务端完成：取二维码 → 轮询 ptqrlogin → 跟随跳转链收 Cookie → 落盘 data/pd-cookie.txt。
+# 只支持一个登录（单份 Cookie 文件），重新登录会覆盖上一个。
+
+_WEB_LOGIN_APPID = "1600001587"
+_WEB_LOGIN_DAID = "823"
+_WEB_LOGIN_S_URL = "https://pd.qq.com/"
+_WEB_LOGIN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+# 唯一的登录会话（同一时刻只允许一个二维码在等）
+_WEB_LOGIN: Dict[str, Any] = {
+    "client": None, "qrsig": "", "status": "idle", "message": "", "nick": "",
+    "created": 0.0, "last_poll": 0.0, "uin": "",
+}
+_WEB_LOGIN_TTL = 180.0     # 二维码最长等待时间（秒）
+_WEB_LOGIN_POLL_GAP = 1.2  # 服务端轮询最小间隔，避免前端点快了把上游打爆
+
+
+def _hash33(text: str) -> int:
+    """ptqrtoken 算法（官方 ptlogin JS 里的 hash33）。"""
+    e = 0
+    for ch in text:
+        e += (e << 5) + ord(ch)
+    return 2147483647 & e
+
+
+def _web_login_client() -> httpx.Client:
+    return httpx.Client(
+        headers={"User-Agent": _WEB_LOGIN_UA, "Referer": _WEB_LOGIN_S_URL},
+        timeout=20,
+        follow_redirects=True,
+    )
+
+
+def _cookie_header_of(client: httpx.Client) -> str:
+    parts: List[str] = []
+    for c in client.cookies.jar:
+        if c.value:
+            parts.append(f"{c.name}={c.value}")
+    return "; ".join(parts)
+
+
+def _parse_ptui_cb(text: str) -> List[str]:
+    """解析 ptuiCB('code','arg2','url','arg4','msg','nick')。
+
+    各字段的分隔、引号转义、\\uXXXX 转义在不同版本/不同阶段（未扫码、已扫码、登录成功）并不一致，
+    所以这里不套固定模板：先取括号内参数串，再逐段抠引号内容，并对 \\uXXXX 做反转义。
+    """
+    m = re.search(r"ptuiCB\((.*)\)", text or "", re.S)
+    if not m:
+        return []
+    parts: List[str] = []
+    for raw in re.findall(r"'((?:\\.|[^'\\])*)'", m.group(1)):
+        if "\\u" in raw:
+            try:
+                raw = raw.encode("utf-8", "surrogatepass").decode("unicode_escape")
+            except Exception:
+                pass
+        parts.append(raw)
+    return parts
+
+
+def _close_web_login() -> None:
+    client = _WEB_LOGIN.get("client")
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+    _WEB_LOGIN.update({"client": None, "qrsig": "", "status": "idle", "message": "", "nick": "", "uin": ""})
+
+
+def _slot_cookie_files() -> List[Path]:
+    """各槽位目录下的网页 Cookie 文件（直接扫目录：users.json 里没有的残留槽位也要清）。"""
+    out: List[Path] = []
+    try:
+        for d in USERS_DIR.iterdir():
+            f = d / "pd-cookie.txt"
+            if f.is_file():
+                out.append(f)
+    except OSError:
+        pass
+    return out
+
+
+def _save_web_cookie(cookie: str) -> None:
+    """网页登录态只保留一份：写全局 data/pd-cookie.txt，并清掉槽位里的同名文件（否则会被优先读到）。"""
+    _ensure_parent(COOKIE_FILE)
+    COOKIE_FILE.write_text(cookie, encoding="utf-8")
+    for f in _slot_cookie_files():
+        try:
+            f.unlink()
+        except OSError:
+            continue
+    _PROXY_COOKIES.clear()
+
+
+def _drop_web_cookie() -> int:
+    """清除网页登录态（全局 + 各槽位），不动 CLI 登录。返回删除的文件数。"""
+    removed = 0
+    for f in [COOKIE_FILE] + _slot_cookie_files():
+        try:
+            if f.is_file():
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    _PROXY_COOKIES.clear()
+    return removed
+
+
+@register_route("POST", "/api/ext/tencent-channel/web-login/start")
+async def api_web_login_start(request: web.Request):
+    """取一张新的扫码二维码（会作废上一个会话）。"""
+    _close_web_login()
+    _WEB_LOGIN.update({"status": "waiting", "message": "等待扫码", "created": time.time(), "last_poll": 0.0})
+    try:
+        client = _web_login_client()
+        await asyncio.to_thread(client.get, "https://xui.ptlogin2.qq.com/cgi-bin/xlogin", params={
+            "appid": _WEB_LOGIN_APPID, "hide_close_icon": "1", "daid": _WEB_LOGIN_DAID,
+            "s_url": _WEB_LOGIN_S_URL, "style": "20", "low_login": "0", "pt_no_auth": "0",
+        })
+        resp = await asyncio.to_thread(client.get, "https://ssl.ptlogin2.qq.com/ptqrshow", params={
+            "appid": _WEB_LOGIN_APPID, "e": "2", "l": "M", "s": "3", "d": "72", "v": "4",
+            "t": "%.8f" % (random.random() * 10 ** 17), "daid": _WEB_LOGIN_DAID, "pt_3rd_aid": "0",
+        })
+        qrsig = client.cookies.get("qrsig") or ""
+        if resp.status_code != 200 or not qrsig or not resp.content.startswith(b"\x89PNG"):
+            try:
+                client.close()
+            except Exception:
+                pass
+            _WEB_LOGIN.update({"status": "failed", "message": f"获取二维码失败（HTTP {resp.status_code}）"})
+            return web.json_response({"success": False, "message": _WEB_LOGIN["message"]})
+        _WEB_LOGIN.update({"client": client, "qrsig": qrsig, "status": "waiting", "message": "等待扫码"})
+        return web.json_response({"success": True, "data": {
+            "qrcode": "data:image/png;base64," + base64.b64encode(resp.content).decode("ascii"),
+            "expires_in_s": int(_WEB_LOGIN_TTL),
+        }})
+    except Exception as e:
+        _WEB_LOGIN.update({"status": "failed", "message": f"获取二维码失败：{e}"})
+        return web.json_response({"success": False, "message": _WEB_LOGIN["message"]})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web-login/poll")
+async def api_web_login_poll(request: web.Request):
+    """轮询扫码结果；成功后把 Cookie 落盘并即刻对代理生效。"""
+    client = _WEB_LOGIN.get("client")
+    state = {"status": _WEB_LOGIN.get("status") or "idle", "message": _WEB_LOGIN.get("message") or "",
+             "nick": _WEB_LOGIN.get("nick") or "", "uin": _WEB_LOGIN.get("uin") or ""}
+    if client is None or not _WEB_LOGIN.get("qrsig"):
+        return web.json_response({"success": True, "data": state})
+    if time.time() - float(_WEB_LOGIN.get("created") or 0) > _WEB_LOGIN_TTL:
+        _close_web_login()
+        state.update({"status": "expired", "message": "二维码已过期，请重新获取"})
+        return web.json_response({"success": True, "data": state})
+    if state["status"] in ("ok", "expired", "denied", "failed"):
+        return web.json_response({"success": True, "data": state})
+    if time.time() - float(_WEB_LOGIN.get("last_poll") or 0) < _WEB_LOGIN_POLL_GAP:
+        return web.json_response({"success": True, "data": state})
+    _WEB_LOGIN["last_poll"] = time.time()
+    try:
+        resp = await asyncio.to_thread(client.get, "https://ssl.ptlogin2.qq.com/ptqrlogin", params={
+            "u1": _WEB_LOGIN_S_URL, "ptqrtoken": str(_hash33(_WEB_LOGIN["qrsig"])), "ptredirect": "0",
+            "h": "1", "t": "1", "g": "1", "from_ui": "1", "ptlang": "2052",
+            "action": "0-0-%d" % int(time.time() * 1000), "js_ver": "10233", "js_type": "1",
+            "login_sig": client.cookies.get("pt_login_sig") or "", "pt_uistyle": "40",
+            "aid": _WEB_LOGIN_APPID, "daid": _WEB_LOGIN_DAID, "has_onekey": "1",
+        })
+        text = resp.text or ""
+        parts = _parse_ptui_cb(text)
+        if not parts:
+            # 不落成终态：二维码还有效，下一轮再试（官方返回格式会随阶段变化，重试能自愈）
+            state.update({"status": "waiting", "message": "登录返回异常，正在重试：" + text.strip()[:120]})
+            _WEB_LOGIN.update(state)
+            return web.json_response({"success": True, "data": state})
+        code = parts[0]
+        url = parts[2] if len(parts) > 2 else ""
+        message = parts[4] if len(parts) > 4 else ""
+        nick = parts[5] if len(parts) > 5 else ""
+        if code == "0":
+            # 跟随 check_sig → pd.qq.com 的跳转链收 Cookie（p_skey 等在这一步落地）
+            if url:
+                await asyncio.to_thread(client.get, url)
+            cookie = _cookie_header_of(client)
+            if "p_skey" not in cookie:
+                await asyncio.to_thread(client.get, _WEB_LOGIN_S_URL)
+                cookie = _cookie_header_of(client)
+            if "p_skey" not in cookie:
+                state.update({"status": "failed", "message": "登录成功但没拿到网页会话 Cookie（可能被风控拦截）"})
+            else:
+                _save_web_cookie(cookie)
+                uin = ""
+                for part in cookie.split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k in ("p_uin", "uin") and v:
+                        uin = v.lstrip("o0") or v
+                        break
+                state.update({"status": "ok", "message": "登录成功", "nick": nick.strip(),
+                              "uin": uin, "logged_in": True})
+        elif code == "65":
+            state.update({"status": "expired", "message": message or "二维码已失效，请重新获取"})
+            _close_web_login()
+        elif code == "66":
+            state.update({"status": "waiting", "message": message or "等待扫码"})
+        elif code == "67":
+            state.update({"status": "scanned", "message": message or "已扫码，请在手机上确认"})
+        elif code == "68":
+            state.update({"status": "denied", "message": message or "已取消登录"})
+        else:
+            state.update({"status": "failed", "message": message or ("登录失败（code %s）" % code)})
+        _WEB_LOGIN.update(state)
+        if state["status"] == "ok":
+            _WEB_LOGIN.update({"client": None, "qrsig": ""})
+            try:
+                client.close()
+            except Exception:
+                pass
+        return web.json_response({"success": True, "data": state})
+    except Exception as e:
+        state.update({"status": "failed", "message": f"轮询失败：{e}"})
+        return web.json_response({"success": True, "data": state})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web-login/status")
+async def api_web_login_status(request: web.Request):
+    """当前网页登录态（只认全局那份 Cookie；仅允许登录一个）。"""
+    cookie = ""
+    try:
+        if COOKIE_FILE.is_file():
+            cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        cookie = ""
+    pairs: Dict[str, str] = {}
+    for part in cookie.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k and v:
+            pairs[k] = v
+    uin = pairs.get("p_uin") or pairs.get("uin") or ""
+    return web.json_response({"success": True, "data": {
+        "logged_in": "p_skey" in pairs,
+        "uin": uin.lstrip("o0") or uin,
+        "nick": _WEB_LOGIN.get("nick") or "",
+        "cookie_count": len(pairs),
+        "polling": bool(_WEB_LOGIN.get("client") and _WEB_LOGIN.get("status") in ("waiting", "scanned")),
+    }})
+
+
+@register_route("POST", "/api/ext/tencent-channel/web-login/logout")
+async def api_web_login_logout(request: web.Request):
+    """退出网页登录（只清网页 Cookie，不影响 CLI 扫码登录）。"""
+    _close_web_login()
+    removed = _drop_web_cookie()
+    return web.json_response({"success": True, "message": "已退出网页登录" if removed else "本来就没有网页登录态"})
 
 
 # ==================== 页面注册 ====================

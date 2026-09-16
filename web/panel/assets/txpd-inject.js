@@ -488,6 +488,24 @@
     '.mobile-header-container{display:none!important;}',
     // 发布器展开态：解除官方收起态的 44px 高度裁剪（否则输入区在裁剪区外不可见不可点）
     '.publish-editor-container[data-txpd-expanded="1"] .editor-area{height:auto!important;min-height:130px;overflow:visible!important;}',
+    // 插件管理（整页视图）
+    '.txpd-manage{display:flex;flex-direction:column;gap:14px;height:100%;overflow:auto;padding:18px 22px;box-sizing:border-box;}',
+    '.txpd-mg-head{display:flex;align-items:center;gap:12px;}',
+    '.txpd-mg-title{font-size:16px;font-weight:600;color:var(--text-primary,#222);}',
+    '.txpd-mg-card{background:var(--bg-middle-light,#fff);border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:12px;padding:16px 18px;}',
+    '.txpd-mg-card h3{margin:0 0 6px;font-size:14px;font-weight:600;color:var(--text-primary,#222);}',
+    '.txpd-mg-desc{margin:0 0 12px;font-size:12px;line-height:1.7;color:var(--text-secondary,#8a8a8a);}',
+    '.txpd-mg-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}',
+    '.txpd-mg-status{font-size:13px;color:var(--text-primary,#222);}',
+    '.txpd-mg-btn{height:34px;padding:0 16px;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:100px;background:var(--bg-middle-light,#fff);color:var(--text-link,#2b64f5);font-size:13px;font-family:inherit;cursor:pointer;}',
+    '.txpd-mg-btn:hover{background:#f2f4f8;}',
+    '.txpd-mg-btn.primary{background:var(--feedback-brand,#2b64f5);border-color:transparent;color:#fff;}',
+    '.txpd-mg-btn.primary:hover{opacity:.92;background:var(--feedback-brand,#2b64f5);}',
+    '.txpd-mg-btn:disabled{opacity:.5;cursor:default;}',
+    '.txpd-mg-qr{display:none;margin-top:14px;text-align:center;}',
+    '.txpd-mg-qr img{width:168px;height:168px;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;background:#fff;}',
+    '.txpd-mg-qr-tip{margin-top:8px;font-size:12px;color:var(--text-secondary,#8a8a8a);}',
+    '.txpd-mg-textarea{width:100%;min-height:110px;box-sizing:border-box;border:1px solid var(--border-primary,rgba(219,220,224,.9));border-radius:8px;padding:10px 12px;font-size:13px;font-family:inherit;line-height:1.6;resize:vertical;color:var(--text-primary,#222);background:var(--bg-middle-light,#fff);}',
     // 右侧抽屉（私信/插件管理员）
     '#txpd-drawer{position:fixed;top:0;right:0;bottom:0;width:380px;max-width:94vw;background:#fff;z-index:2147483003;box-shadow:-8px 0 32px rgba(0,0,0,.18);display:none;flex-direction:column;font-family:inherit;}',
     '#txpd-drawer-head{padding:14px 16px;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}',
@@ -662,6 +680,7 @@
   //   2) 已加入频道的视图不应再显示「加入频道」按钮
   setInterval(function () {
     getAccountsState().then(function (any) {
+      if (!document.body) return;   // 解析早期（还没到 body）：这轮跳过，3 秒后重来
       if (any) {
         var b = findVisibleButton('登录');
         if (b) b.textContent = '切换账号';
@@ -906,7 +925,7 @@
   function toast(msg) {
     if (!toastEl) {
       toastEl = el('div');
-      toastEl.style.cssText = 'position:fixed;left:50%;bottom:36px;transform:translateX(-50%);z-index:2147483002;background:rgba(20,20,30,.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;max-width:80vw;transition:opacity .4s;';
+      toastEl.style.cssText = 'position:fixed;left:50%;bottom:36px;transform:translateX(-50%);z-index:2147483002;background:rgba(20,20,30,.92);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;max-width:80vw;transition:opacity .4s;pointer-events:none;';
       (document.body || document.documentElement).appendChild(toastEl);
     }
     toastEl.textContent = msg;
@@ -1540,29 +1559,265 @@
     });
   }
 
-  // ---------- 插件管理员 ----------
-  function openAdmins() {
-    var dlgP = openDrawer('插件管理员');
-    var ta = areaInput('管理员 QQ 号（每行一个）', '', 100);
-    var save = primaryBtn('保存');
-    var status = statusLine();
-    dlgP.appendChild(ta);
-    dlgP.appendChild(save);
-    dlgP.appendChild(status);
+  // ---------- 插件管理（整页视图，替代原右侧抽屉） ----------
+  // 三个板块：网页登录（只影响页面按登录态显示内容）/ 频道账号（CLI，发帖评论等操作用它）/ 插件管理员。
+  var _manageOpen = false;
+  var _managePath = '';
+  var _managePage = null;
+  var _wlPollTimer = null;
+  var _wlActive = false;   // 一条轮询链是否在跑（定时器等待中 + 请求中）
+  var _wlImgUrl = '';
+  var _wlDone = false;   // 本轮二维码已到终态（成功/失效/失败），不再轮询
+
+  function openManagePage() {
+    _manageOpen = true;
+    _managePath = routeKey();
+    ensureManagePage();
+  }
+  function closeManagePage() {
+    _manageOpen = false;
+    ensureManagePage();
+  }
+  function stopWebLoginPoll() {
+    if (_wlPollTimer) { clearTimeout(_wlPollTimer); _wlPollTimer = null; }
+  }
+  // 路由标识：应用有时会把地址规范化成不带 baseURL 的形态，所以统一只比「尾段」
+  function routeKey() {
+    var p = window.location.pathname;
+    if (p.indexOf(PANEL_BASE) === 0) p = p.slice(PANEL_BASE.length);
+    return p.replace(/^\/+/, '').replace(/\/+$/, '');
+  }
+
+  function ensureManagePage() {
+    var explore = document.getElementById('explorePage');
+    var dyn = document.querySelector('.txpd-dynamic');
+    // 用户点了别的导航/频道 → 自动收起（整页视图不跟随应用路由）
+    if (_manageOpen && _managePath && routeKey() !== _managePath) _manageOpen = false;
+    if (!_manageOpen) {
+      if (_managePage && _managePage.parentNode) _managePage.parentNode.removeChild(_managePage);
+      if (dyn) dyn.style.display = '';
+      return;
+    }
+    var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main');
+    if (!host) return;
+    if (explore) explore.style.display = 'none';
+    if (dyn) dyn.style.display = 'none';
+    // 复用同一个页面节点：应用重渲染会把我们塞进去的节点挪走/删掉，重建会让元素身份变化
+    // （按钮点一半就失效），所以只负责「贴回去」。
+    if (!_managePage) _managePage = buildManagePage();
+    if (_managePage.parentNode !== host) {
+      host.appendChild(_managePage);
+      restoreWebLoginUi();   // 刚被贴回：把二维码贴回并确保轮询还活着
+    }
+    syncManageStatus();
+  }
+
+  // 整页视图被应用重渲染后贴回：把仍在轮询中的二维码也贴回去并继续轮询
+  function restoreWebLoginUi() {
+    if (!_wlImgUrl) return;
+    var img = document.getElementById('txpd-wl-qr');
+    var box = document.getElementById('txpd-wl-qrbox');
+    if (img && box) {
+      if (img.getAttribute('src') !== _wlImgUrl) img.setAttribute('src', _wlImgUrl);
+      box.style.display = 'block';
+    }
+    if (!_wlActive) pollWebLogin();
+  }
+
+  function mgBtn(text, primary) {
+    var b = el('button', { 'class': 'txpd-mg-btn' + (primary ? ' primary' : ''), type: 'button' }, text);
+    return b;
+  }
+  function mgCard(title, desc) {
+    var c = el('div', { 'class': 'txpd-mg-card' });
+    if (title) c.appendChild(el('h3', null, title));
+    if (desc) c.appendChild(el('p', { 'class': 'txpd-mg-desc' }, desc));
+    return c;
+  }
+
+  function buildManagePage() {
+    var page = el('div', { 'class': 'app-page txpd-manage' });
+    var head = el('div', { 'class': 'txpd-mg-head' });
+    var back = mgBtn('← 返回');
+    back.addEventListener('click', closeManagePage);
+    head.appendChild(back);
+    head.appendChild(el('span', { 'class': 'txpd-mg-title' }, '插件管理'));
+    page.appendChild(head);
+
+    // ① 网页登录
+    var card = mgCard('网页登录',
+      '用来按登录态显示频道内容（能看成员可见的频道 / 帖子）。点赞、评论、发帖等操作始终由下面的频道账号（CLI）完成，'
+      + '这里的登录不参与那些操作。只允许登录一个。');
+    var row = el('div', { 'class': 'txpd-mg-row' });
+    var st = el('span', { 'class': 'txpd-mg-status', id: 'txpd-wl-status' }, '状态：读取中…');
+    var btnStart = mgBtn('获取登录二维码', true);
+    var btnOut = mgBtn('退出登录');
+    row.appendChild(st);
+    row.appendChild(btnStart);
+    row.appendChild(btnOut);
+    card.appendChild(row);
+    var qrBox = el('div', { 'class': 'txpd-mg-qr', id: 'txpd-wl-qrbox' });
+    var img = el('img', { id: 'txpd-wl-qr', alt: '登录二维码' });
+    img.setAttribute('src', '');
+    var tip = el('div', { 'class': 'txpd-mg-qr-tip', id: 'txpd-wl-tip' }, '');
+    qrBox.appendChild(img);
+    qrBox.appendChild(tip);
+    card.appendChild(qrBox);
+    page.appendChild(card);
+
+    btnStart.addEventListener('click', function () {
+      btnStart.disabled = true;
+      _wlDone = false;
+      st.style.color = '#888';
+      st.textContent = '状态：正在获取二维码…';
+      api('/web-login/start', { method: 'POST', body: {} }).then(function (r) {
+        if (!r.success || !r.data || !r.data.qrcode) throw new Error(r.message || '获取二维码失败');
+        _wlImgUrl = r.data.qrcode;
+        img.setAttribute('src', _wlImgUrl);
+        qrBox.style.display = 'block';
+        tip.textContent = '请用手机 QQ 扫码并确认（' + Math.round((r.data.expires_in_s || 180) / 60) + ' 分钟内有效）';
+        st.style.color = '';
+        st.textContent = '状态：等待扫码…';
+        pollWebLogin();
+      }).catch(function (e) {
+        panelError(st, e.message || '获取二维码失败');
+      }).then(function () { btnStart.disabled = false; });
+    });
+    btnOut.addEventListener('click', function () {
+      btnOut.disabled = true;
+      api('/web-login/logout', { method: 'POST', body: {} }).then(function (r) {
+        stopWebLoginPoll();
+        _wlActive = false;
+        _wlDone = true;
+        qrBox.style.display = 'none';
+        img.setAttribute('src', '');
+        _wlImgUrl = '';
+        st.style.color = '#888';
+        st.textContent = '状态：' + (r.message || '已退出网页登录');
+        syncManageStatus(true);
+      }).catch(function (e) {
+        panelError(st, e.message || '退出失败');
+      }).then(function () { btnOut.disabled = false; });
+    });
+
+    // ② 频道账号（CLI）
+    var card2 = mgCard('频道账号（CLI）', '发帖、评论、点赞、私信等操作都由这个账号完成，与上面的网页登录互不影响。');
+    var row2 = el('div', { 'class': 'txpd-mg-row' });
+    var st2 = el('span', { 'class': 'txpd-mg-status', id: 'txpd-cli-status' }, '状态：读取中…');
+    var btnAcct = mgBtn('登录 / 切换账号', true);
+    btnAcct.addEventListener('click', openAccountList);
+    row2.appendChild(st2);
+    row2.appendChild(btnAcct);
+    card2.appendChild(row2);
+    page.appendChild(card2);
+
+    // ③ 插件管理员
+    var card3 = mgCard('插件管理员', '一行一个 QQ 号；留空并保存即清空。');
+    var ta = el('textarea', { 'class': 'txpd-mg-textarea', placeholder: '管理员 QQ 号（每行一个）' });
+    var row3 = el('div', { 'class': 'txpd-mg-row', style: 'margin-top:10px;' });
+    var save = mgBtn('保存', true);
+    var st3 = el('span', { 'class': 'txpd-mg-status' }, '');
+    row3.appendChild(save);
+    row3.appendChild(st3);
+    card3.appendChild(ta);
+    card3.appendChild(row3);
+    page.appendChild(card3);
     api('/admins').then(function (r) {
       if (r.success && r.data && r.data.admins) ta.value = r.data.admins.join('\n');
     }).catch(function () { /* 忽略 */ });
     save.addEventListener('click', function () {
       save.disabled = true;
-      status.style.color = '#888';
-      status.textContent = '正在保存…';
+      st3.style.color = '#888';
+      st3.textContent = '正在保存…';
       var admins = ta.value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
       api('/admins', { method: 'POST', body: { admins: admins } }).then(function (r) {
         if (!r.success) throw new Error(r.message || '保存失败');
-        status.textContent = '✓ 已保存 ' + admins.length + ' 个管理员';
-        status.style.color = '#15a361';
-      }).catch(function (e) { panelError(status, e.message); }).then(function () { save.disabled = false; });
+        st3.textContent = '✓ 已保存 ' + admins.length + ' 个管理员';
+        st3.style.color = '#15a361';
+      }).catch(function (e) { panelError(st3, e.message); }).then(function () { save.disabled = false; });
     });
+    return page;
+  }
+
+  function pollWebLogin() {
+    stopWebLoginPoll();
+    _wlActive = true;
+    _wlPollTimer = setTimeout(function () {
+      // 每轮重新取元素：整页视图可能被应用重渲染，闭包里缓存的节点会失效
+      var st = document.getElementById('txpd-wl-status');
+      var qrBox = document.getElementById('txpd-wl-qrbox');
+      var tip = document.getElementById('txpd-wl-tip');
+      if (!st && !qrBox) { stopWebLoginPoll(); return; }
+      api('/web-login/poll').then(function (r) {
+        var d = (r && r.data) || {};
+        switch (d.status) {
+          case 'ok':
+            _wlDone = true;
+            _wlActive = false;
+            _wlImgUrl = '';
+            if (st) { st.style.color = '#15a361'; st.textContent = '状态：✓ 已登录' + (d.nick ? '（' + d.nick + '）' : (d.uin ? '（' + d.uin + '）' : '')) + '，正在刷新页面…'; }
+            if (tip) tip.textContent = '登录成功，页面将按登录态重新渲染';
+            stopWebLoginPoll();
+            setTimeout(function () { window.location.reload(); }, 1200);
+            return;
+          case 'expired':
+          case 'denied':
+          case 'failed':
+            _wlDone = true;
+            _wlActive = false;
+            _wlImgUrl = '';
+            if (tip) tip.textContent = d.message || '二维码已失效';
+            if (st) { st.style.color = '#e5484d'; st.textContent = '状态：' + (d.message || '登录失败') + '（可重新获取二维码）'; }
+            if (d.status !== 'failed') { if (qrBox) qrBox.style.display = 'none'; }
+            stopWebLoginPoll();
+            return;
+          default:
+            if (st) st.textContent = '状态：' + (d.message || '等待扫码…');
+            pollWebLogin();
+        }
+      }).catch(function () {
+        pollWebLogin();
+      });
+    }, 2000);
+  }
+
+  var _mgStatusTs = 0;
+  function syncManageStatus(force) {
+    var now = Date.now();
+    if (!force && now - _mgStatusTs < 5000) return;
+    _mgStatusTs = now;
+    api('/web-login/status').then(function (r) {
+      // 正在轮询二维码时状态行归 pollWebLogin() 管，这里别把它覆盖掉
+      if (_wlPollTimer || _wlImgUrl) return;
+      var st = document.getElementById('txpd-wl-status');
+      if (!st) return;
+      var d = (r && r.data) || {};
+      st.style.color = d.logged_in ? '#15a361' : '';
+      st.textContent = '状态：' + (d.logged_in ? ('已登录' + (d.nick ? '（' + d.nick + '）' : (d.uin ? '（' + d.uin + '）' : ''))) : '未登录');
+    }).catch(function () { /* 忽略 */ });
+    api('/accounts').then(function (r) {
+      var st2 = document.getElementById('txpd-cli-status');
+      if (!st2) return;
+      var accs = ((r && r.data && r.data.accounts) || []);
+      var inOnes = accs.filter(function (a) { return a.logged_in; });
+      if (!accs.length) st2.textContent = '状态：还没有账号槽位';
+      else if (!inOnes.length) st2.textContent = '状态：未登录（' + accs.length + ' 个槽位）';
+      else st2.textContent = '状态：已登录 ' + inOnes.map(function (a) { return a.nickname || a.name; }).join('、');
+    }).catch(function () { /* 忽略 */ });
+  }
+
+  // 没有 CLI 账号（未登录/无槽位）时自动打开插件管理，引导先登录
+  var _manageAutoTried = false;
+  function maybeAutoOpenManage() {
+    if (_manageAutoTried || _manageOpen) return;
+    api('/accounts').then(function (r) {
+      var accs = ((r && r.data && r.data.accounts) || []);
+      var anyIn = accs.some(function (a) { return a.logged_in; });
+      if (anyIn) { _manageAutoTried = true; return; }
+      _manageAutoTried = true;
+      openManagePage();
+      toast('还没有登录频道账号，先在这里完成登录');
+    }).catch(function () { /* 忽略 */ });
   }
 
   // ---------- 频道卡 operation 行：插件图标按钮（配置/定时/成员）
@@ -1647,10 +1902,11 @@
 
   // ---------- 桌面 UA 窄屏抽屉控制（<768；应用抽屉开关是移动 UA 门控的） ----------
   function ensureNarrowDrawer() {
-    var narrow = !window.matchMedia('(min-width: 768px)').matches;
-    var desktopUA = document.body.classList.contains('force-full-width');
-    var active = narrow && desktopUA;
     var body = document.body;
+    if (!body) return;   // 解析早期还没有 body（head 里的阻塞样式表能拖住很久）
+    var narrow = !window.matchMedia('(min-width: 768px)').matches;
+    var desktopUA = body.classList.contains('force-full-width');
+    var active = narrow && desktopUA;
     if (!active) {
       if (body.classList.contains('txpd-drawer-open')) body.classList.remove('txpd-drawer-open');
       return;
@@ -1713,7 +1969,7 @@
     if (firstItem) nav.insertBefore(dynEntry, firstItem); else nav.appendChild(dynEntry);
     nav.appendChild(mk('txpd-nav-schedule', '定时发帖', 'assets/common.svg#setting', '定时发帖', function () { openScheduleDialog(null); }));
     nav.appendChild(mk('txpd-nav-dm', '私信列表', 'assets/nav.svg#discuss', '私信列表', openDmList));
-    nav.appendChild(mk('txpd-nav-admin', '插件管理', 'assets/nav.svg#manage', '插件管理', openAdmins));
+    nav.appendChild(mk('txpd-nav-admin', '插件管理', 'assets/nav.svg#manage', '插件管理', openManagePage));
   }
 
   // ---------- 发帖修复：已加入频道隐藏「登录后…」+ 接管「发表」为 CLI ----------
@@ -3782,6 +4038,13 @@
     _uiSyncQueued = true;
     setTimeout(function () {
       _uiSyncQueued = false;
+      // body 还没解析出来（head 里的阻塞样式表 / 大段内联脚本会拖很久）：
+      // 这一批 ensure* 都要操作 body，直接跑会 null.classList 抛错并中断整批，
+      // 所以和 mount() 一样重排一次，等 body 就绪再同步。
+      if (!document.body) {
+        queueUiSync();
+        return;
+      }
       ensureTopbarButtons();
       ensureNavEntries();
       syncPublishArea();
@@ -3792,6 +4055,7 @@
       syncCommentPlaceholder();
       ensureGatedFallback();
       ensureDynamicPage();
+      ensureManagePage();     // 放在动态页之后：整页视图要能盖住动态页
     }, 120);
   }
   function mount() {
@@ -3799,6 +4063,8 @@
     applyCachedAcctState();
     ensureJoinedSection();
     queueUiSync();
+    // 没有任何已登录的 CLI 账号 → 自动打开插件管理，引导先登录
+    setTimeout(maybeAutoOpenManage, 1200);
     // 挂 window 捕获层：应用的全局守卫在 window 捕获里 stopPropagation 拦截点赞/评论点击
     // （document 层的监听收不到事件），同层后注册的监听仍可运行
     window.addEventListener('click', function (e) {
