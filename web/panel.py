@@ -1037,8 +1037,12 @@ async def api_upload_image(request: web.Request):
 
 
 async def _serve_blocked(request: web.Request) -> web.Response:
-    """被注入脚本封锁的 qq 域请求统一落到这里：204 无内容，不产生控制台错误。"""
-    return web.Response(status=204)
+    """被注入脚本封锁的 qq 域请求统一落到这里。
+
+    返回 200 + 最小 JSON，而不是 204 空响应：调用方常用 res.json() 解析，
+    空响应会抛 "Unexpected end of JSON input"（控制台噪音）；请求本身不会触达 qq.com。
+    """
+    return web.json_response({"retcode": 0, "data": {}, "message": ""})
 
 
 async def _serve_panel_index(request: web.Request) -> web.Response:
