@@ -4,10 +4,10 @@
 
 页面：
 - web/panel/index.html —— pd.qq.com/explore 官方页面原样镜像，
-  以完整 HTML 文档挂在 /api/web-pages/txpd-panel（宿主 iframe 加载）。
+  以完整 HTML 文档挂在 /api/web-pages/tencent-channel-panel（宿主 iframe 加载）。
 - web/panel/manage.html —— 旧版管理界面（历史遗留，可自行挂载）。
 
-管理 API（/api/ext/txpd/*，全部复用后台登录鉴权）：
+管理 API（/api/ext/tencent-channel/*，全部复用后台登录鉴权）：
 - POST /cli            65 个 CLI action 白名单
 - GET/POST /users      账号槽位列表 / 增删切换
 - POST /users/status   单槽位登录状态+昵称
@@ -382,7 +382,7 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
 
     宿主 match_route 前缀路由不会填充 match_info，tail 需从 request.path 截取。
     """
-    prefix = "/api/ext/txpd/pd/"
+    prefix = "/api/ext/tencent-channel/pd/"
     path = request.path
     tail = path[len(prefix):] if path.startswith(prefix) else ""
     tail = tail.lstrip("/")
@@ -430,7 +430,7 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
         content_type=ct or None,
     )
 
-PAGE_KEY = "txpd-panel"
+PAGE_KEY = "tencent-channel-panel"
 
 _PANEL_DIR = Path(__file__).resolve().parent / "panel"
 _ASSETS_DIR = _PANEL_DIR / "assets"
@@ -609,7 +609,7 @@ async def _json_body(request: web.Request) -> Dict[str, Any]:
 # ==================== 路由 ====================
 
 
-@register_route("POST", "/api/ext/txpd/cli")
+@register_route("POST", "/api/ext/tencent-channel/cli")
 async def api_cli(request: web.Request):
     body = await _json_body(request)
     action = str(body.get("action") or "").strip()
@@ -624,12 +624,12 @@ async def api_cli(request: web.Request):
 # ==================== 账号槽位 ====================
 
 
-@register_route("GET", "/api/ext/txpd/users")
+@register_route("GET", "/api/ext/tencent-channel/users")
 async def api_get_users(request: web.Request):
     return web.json_response({"success": True, "data": _load_users()})
 
 
-@register_route("POST", "/api/ext/txpd/users")
+@register_route("POST", "/api/ext/tencent-channel/users")
 async def api_post_users(request: web.Request):
     body = await _json_body(request)
     op = str(body.get("op") or "").strip()
@@ -654,7 +654,7 @@ async def api_post_users(request: web.Request):
     return web.json_response({"success": ok, "message": message, "data": _load_users()})
 
 
-@register_route("POST", "/api/ext/txpd/users/status")
+@register_route("POST", "/api/ext/tencent-channel/users/status")
 async def api_user_status(request: web.Request):
     """查询指定槽位的登录状态与昵称（昵称成功时顺带缓存）。"""
     body = await _json_body(request)
@@ -677,7 +677,7 @@ async def api_user_status(request: web.Request):
 # ==================== 发帖历史 ====================
 
 
-@register_route("GET", "/api/ext/txpd/history")
+@register_route("GET", "/api/ext/tencent-channel/history")
 async def api_get_history(request: web.Request):
     return web.json_response({"success": True, "data": {"history": feed_scheduler.load_history()}})
 
@@ -685,12 +685,12 @@ async def api_get_history(request: web.Request):
 # ==================== 插件管理员 ====================
 
 
-@register_route("GET", "/api/ext/txpd/admins")
+@register_route("GET", "/api/ext/tencent-channel/admins")
 async def api_get_admins(request: web.Request):
     return web.json_response({"success": True, "data": {"admins": _load_admins()}})
 
 
-@register_route("POST", "/api/ext/txpd/admins")
+@register_route("POST", "/api/ext/tencent-channel/admins")
 async def api_save_admins(request: web.Request):
     body = await _json_body(request)
     raw = body.get("admins")
@@ -721,12 +721,12 @@ def _notify_settings_data() -> Dict[str, Any]:
     }
 
 
-@register_route("GET", "/api/ext/txpd/notify-settings")
+@register_route("GET", "/api/ext/tencent-channel/notify-settings")
 async def api_get_notify_settings(request: web.Request):
     return web.json_response({"success": True, "data": _notify_settings_data()})
 
 
-@register_route("POST", "/api/ext/txpd/notify-settings")
+@register_route("POST", "/api/ext/tencent-channel/notify-settings")
 async def api_save_notify_settings(request: web.Request):
     body = await _json_body(request)
     if "dm_merge_window" in body:
@@ -755,13 +755,13 @@ async def api_save_notify_settings(request: web.Request):
 # ==================== 定时发帖 ====================
 
 
-@register_route("GET", "/api/ext/txpd/schedules")
+@register_route("GET", "/api/ext/tencent-channel/schedules")
 async def api_get_schedules(request: web.Request):
     examples = [{"expr": expr, "desc": desc} for expr, desc in feed_scheduler.CRON_EXAMPLES]
     return web.json_response({"success": True, "data": {"schedules": feed_scheduler.load_schedules(), "cron_examples": examples}})
 
 
-@register_route("POST", "/api/ext/txpd/schedules/save")
+@register_route("POST", "/api/ext/tencent-channel/schedules/save")
 async def api_save_schedule(request: web.Request):
     body = await _json_body(request)
     normalized = feed_scheduler.normalize_schedule(body)
@@ -781,7 +781,7 @@ async def api_save_schedule(request: web.Request):
     return web.json_response({"success": True, "message": "计划已保存", "data": {"schedule": normalized}})
 
 
-@register_route("POST", "/api/ext/txpd/schedules/toggle")
+@register_route("POST", "/api/ext/tencent-channel/schedules/toggle")
 async def api_toggle_schedule(request: web.Request):
     body = await _json_body(request)
     schedule_id = str(body.get("id") or "").strip()
@@ -795,7 +795,7 @@ async def api_toggle_schedule(request: web.Request):
     return web.json_response({"success": False, "message": "计划不存在"})
 
 
-@register_route("POST", "/api/ext/txpd/schedules/run")
+@register_route("POST", "/api/ext/tencent-channel/schedules/run")
 async def api_run_schedule(request: web.Request):
     body = await _json_body(request)
     schedule_id = str(body.get("id") or "").strip()
@@ -806,7 +806,7 @@ async def api_run_schedule(request: web.Request):
     return web.json_response({"success": result["ok"], "message": result["message"]})
 
 
-@register_route("POST", "/api/ext/txpd/schedules/delete")
+@register_route("POST", "/api/ext/tencent-channel/schedules/delete")
 async def api_delete_schedule(request: web.Request):
     body = await _json_body(request)
     schedule_id = str(body.get("id") or "").strip()
@@ -818,7 +818,7 @@ async def api_delete_schedule(request: web.Request):
     return web.json_response({"success": True, "message": "计划已删除"})
 
 
-@register_route("POST", "/api/ext/txpd/publish")
+@register_route("POST", "/api/ext/tencent-channel/publish")
 async def api_publish_feed(request: web.Request):
     """立即发帖（与定时发帖同一套参数：format=text/md/html + images/videos）。"""
     body = await _json_body(request)
@@ -844,7 +844,7 @@ def _slot_has_token(user: str) -> bool:
         return False
 
 
-@register_route("GET", "/api/ext/txpd/accounts")
+@register_route("GET", "/api/ext/tencent-channel/accounts")
 async def api_accounts(request: web.Request):
     """槽位列表 + 登录状态（供左下角弹窗判断「登录/切换账号」）。"""
     data = _load_users()
@@ -859,7 +859,7 @@ async def api_accounts(request: web.Request):
     return web.json_response({"success": True, "data": {"accounts": accounts, "current": data.get("current", "")}})
 
 
-@register_route("POST", "/api/ext/txpd/accounts/add")
+@register_route("POST", "/api/ext/tencent-channel/accounts/add")
 async def api_accounts_add(request: web.Request):
     """添加账号：创建隔离槽位（或复用传入槽位）并返回登录二维码。"""
     body = await _json_body(request)
@@ -900,7 +900,7 @@ async def api_accounts_add(request: web.Request):
     })
 
 
-@register_route("POST", "/api/ext/txpd/accounts/poll")
+@register_route("POST", "/api/ext/tencent-channel/accounts/poll")
 async def api_accounts_poll(request: web.Request):
     """轮询扫码结果。CLI poll-token 会阻塞至终态，这里用后台任务承载，HTTP 只查状态。"""
     body = await _json_body(request)
@@ -942,7 +942,7 @@ async def api_accounts_poll(request: web.Request):
     })
 
 
-@register_route("GET", "/api/ext/txpd/panel-cookie")
+@register_route("GET", "/api/ext/tencent-channel/panel-cookie")
 async def api_panel_cookie(request: web.Request):
     """当前槽位的 pd.qq.com Cookie 键值对（供注入脚本做虚拟会话 Cookie）。
 
@@ -966,14 +966,14 @@ async def api_panel_cookie(request: web.Request):
     })
 
 
-@register_route("POST", "/api/ext/txpd/accounts/switch")
+@register_route("POST", "/api/ext/tencent-channel/accounts/switch")
 async def api_accounts_switch(request: web.Request):
     body = await _json_body(request)
     ok, message = switch_user(body.get("name"))
     return web.json_response({"success": ok, "message": message})
 
 
-@register_route("POST", "/api/ext/txpd/accounts/delete")
+@register_route("POST", "/api/ext/tencent-channel/accounts/delete")
 async def api_accounts_delete(request: web.Request):
     body = await _json_body(request)
     ok, message = remove_user(body.get("name"))
@@ -1005,7 +1005,7 @@ async def _serve_panel_file(name: str) -> web.Response:
     return web.Response(body=body, content_type=mime)
 
 
-@register_route("POST", "/api/ext/txpd/upload-image")
+@register_route("POST", "/api/ext/tencent-channel/upload-image")
 async def api_upload_image(request: web.Request):
     """发帖插图：base64 图片落盘到 uploads/，返回本地路径供 publish-feed --image 使用。"""
     body = await _json_body(request)
@@ -1043,7 +1043,7 @@ async def _serve_panel_index(request: web.Request) -> web.Response:
     注意：/panel/* 前缀路由优先级低于已注册的精确路由（宿主 longest-prefix 在精确未命中时才生效），
     所以静态资源（.js/.css 等）仍走精确路由；带后缀的未知文件拒绝兜底，防止把 404 误变成页面。
     """
-    tail = request.path[len("/api/ext/txpd/panel/"):] if request.path.startswith("/api/ext/txpd/panel/") else ""
+    tail = request.path[len("/api/ext/tencent-channel/panel/"):] if request.path.startswith("/api/ext/tencent-channel/panel/") else ""
     tail = tail.rstrip("/")
     # 含后缀（.xxx）的请求一律不兑底——未知静态文件必须 404，且防穿越（..%2f 解码后含 ..）
     last_seg = tail.rsplit("/", 1)[-1]
@@ -1078,7 +1078,7 @@ def _register_panel():
         key=PAGE_KEY,
         label="腾讯频道",
         source="plugin",
-        source_name="txpd",
+        source_name=Path(__file__).resolve().parents[1].name,   # 插件目录名（与目录名一致，不写死）
         html_file=str(_PANEL_DIR / "index.html"),
         icon="message-square",
     )
@@ -1088,19 +1088,19 @@ def _register_panel():
             if not f.is_file() or f.name.startswith("_"):
                 continue
             handler = _make_static_handler(f.name)
-            register_route("GET", f"/api/ext/txpd/panel/{f.name}", handler)
-            register_route("GET", f"/api/ext/txpd/panel/assets/{f.name}", handler)
+            register_route("GET", f"/api/ext/tencent-channel/panel/{f.name}", handler)
+            register_route("GET", f"/api/ext/tencent-channel/panel/assets/{f.name}", handler)
             # Vite 预加载器按「模块自身目录 + assets/」拼接，产生 assets/assets/x 双层路径，注册别名兜底
-            register_route("GET", f"/api/ext/txpd/panel/assets/assets/{f.name}", handler)
+            register_route("GET", f"/api/ext/tencent-channel/panel/assets/assets/{f.name}", handler)
     # pd.qq.com 网关代理（前缀路由，透传页面本站 API 请求）
-    register_route("*", "/api/ext/txpd/pd/*", api_pd_proxy)
+    register_route("*", "/api/ext/tencent-channel/pd/*", api_pd_proxy)
     # SPA 路由兜底：Nuxt baseURL 指向 panel/，vue-router 会把地址 rewrite 为 /panel/<path>，
     # 这些无后缀路径必须返回 index.html，否则刷新/直接访问白屏
-    register_route("GET", "/api/ext/txpd/panel/*", _serve_panel_index)
+    register_route("GET", "/api/ext/tencent-channel/panel/*", _serve_panel_index)
 
     # 被封锁请求的静默端点：注入脚本把 qq 域请求改写到此处，返回 204 避免控制台 404 噪音
-    register_route("GET", "/api/ext/txpd/__blocked", _serve_blocked)
-    register_route("POST", "/api/ext/txpd/__blocked", _serve_blocked)
+    register_route("GET", "/api/ext/tencent-channel/__blocked", _serve_blocked)
+    register_route("POST", "/api/ext/tencent-channel/__blocked", _serve_blocked)
 
 
 @on_unload

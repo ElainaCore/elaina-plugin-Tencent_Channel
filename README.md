@@ -19,11 +19,9 @@ CLI 账号完成 —— 浏览器端不需要登录腾讯频道。
 
 ## 安装
 
-1. 把本目录放进宿主的插件目录 `plugins/txpd/`，宿主启动时自动加载（改动后支持热重载）。
-2. Python 依赖见 `requirements.txt`（`aiohttp`、`Pillow`），宿主加载插件时会自动安装。
-3. 命令行工具 `tencent-channel-cli`：
-   - Linux / macOS：插件加载时自动 `npm install` 补全；
-   - Windows：自行安装后把 `tencent-channel-cli.exe` 放在插件目录下（本仓库不附带该二进制）。
+1. 把本目录（整个文件夹）放进宿主的插件目录，
+   插件内部全部使用相对路径，不依赖目录名；宿主启动时自动加载，改动后支持热重载。
+2. 插件市场自行安装
 
 ## 配置
 
