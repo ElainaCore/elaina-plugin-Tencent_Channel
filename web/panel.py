@@ -30,7 +30,7 @@ import copy
 import json
 import time as _time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from aiohttp import web
@@ -413,7 +413,14 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
         headers["Cookie"] = cookie
     headers["Referer"] = "https://pd.qq.com/"
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-    body = await request.read()
+    try:
+        body = await request.read()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # 客户端中途断开（刷新页面 / 关标签）时 aiohttp 以 ConnectionResetError 取消载荷，
+        # 此时连接已死、响应也无处可写，直接静默收尾，避免刷出一条 500 堆栈。
+        return web.Response(status=499)
     # 上游偶发 5xx / 网络抖动：重试一次再放弃（腾讯网关抖一下很常见）
     resp = None
     last_error = ""
@@ -535,6 +542,8 @@ ACTIONS: Dict[str, Dict[str, Any]] = {
     "mute": {"base": ["manage", "modify-member-shut-up"],"required": {"guild_id": "--guild-id", "tiny_id": "--tiny-id"},"optional": {"time_stamp": "--time-stamp"},"yes": True},
     "kick": {"base": ["manage", "kick-guild-member"],"required": {"guild_id": "--guild-id"},"optional": {"tiny_id": "--tiny-id", "member_tinyids": "--member-tinyids", "blacklist": "--blacklist", "revoke_msgs": "--revoke-msgs"},"yes": True},
     "join-guild": {"base": ["manage", "join-guild"],"required": {"guild_id": "--guild-id"}},
+    # 需要附言 / 答题的频道：载荷走 stdin（join_guild_comment / join_guild_answers）
+    "join-guild-verify": {"base": ["manage", "join-guild"]},
     "leave-guild": {"base": ["manage", "leave-guild"],"required": {"guild_id": "--guild-id"},"yes": True},
     "create-channel": {"base": ["manage", "create-channel"],"required": {"guild_id": "--guild-id", "channel_name": "--channel-name"}},
     "modify-channel": {"base": ["manage", "modify-channel"],"required": {"guild_id": "--guild-id", "channel_id": "--channel-id", "channel_name": "--channel-name"}},
@@ -595,8 +604,10 @@ def _build_action_args(action: str, params: Dict[str, Any], user: str = "") -> A
     return {"args": args}
 
 
-async def _run_cli_json(args: List[str], user: str = "") -> Dict[str, Any]:
-    ok, output = await asyncio.to_thread(_run_cli, args, None, user or None)
+async def _run_cli_json(args: List[str], user: str = "", stdin: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # 少数流程（如带附言/答题的加入频道）CLI 从 stdin 收 JSON 载荷
+    stdin_text = json.dumps(stdin, ensure_ascii=False, separators=(",", ":")) if stdin else None
+    ok, output = await asyncio.to_thread(_run_cli, args, stdin_text, user or None)
     output = _normalize_rate_limit(output)
     data = _extract_json(output)
     result: Dict[str, Any] = {"success": ok}
@@ -657,10 +668,12 @@ async def api_cli(request: web.Request):
     action = str(body.get("action") or "").strip()
     params = body.get("params") if isinstance(body.get("params"), dict) else {}
     user = str(body.get("user") or "").strip()
+    # 可选 stdin 载荷：CLI 里需要附言 / 答题的流程（join-guild 等）用它传参
+    stdin = body.get("stdin") if isinstance(body.get("stdin"), dict) else None
     built = _build_action_args(action, params, user)
     if "error" in built:
         return web.json_response({"success": False, "message": built["error"]})
-    return web.json_response(await _run_cli_json(built["args"], user))
+    return web.json_response(await _run_cli_json(built["args"], user, stdin))
 
 
 # ==================== 账号槽位 ====================
@@ -864,7 +877,8 @@ async def api_delete_schedule(request: web.Request):
 async def api_publish_feed(request: web.Request):
     """立即发帖（与定时发帖同一套参数：format=text/md/html + images/videos）。"""
     body = await _json_body(request)
-    normalized = feed_scheduler.normalize_schedule({**body, "cron": "* * * * *"})
+    # 立即发帖允许不选版块（同官方发帖框）
+    normalized = feed_scheduler.normalize_schedule({**body, "cron": "* * * * *"}, require_channel=False)
     if "error" in normalized:
         return web.json_response({"success": False, "message": normalized["error"]})
     feed_scheduler.record_history({**normalized, "kind": "publish"})

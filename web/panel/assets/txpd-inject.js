@@ -39,16 +39,54 @@
     if (!TXPD_EMBED && loc.pathname.indexOf(PANEL_BASE) !== 0) {
       var savedPath = null;
       try { savedPath = window.sessionStorage.getItem('txpd_last_path'); } catch (e) { }
-      var targetPath = savedPath ? savedPath.replace(/^\/+/, '') : 'explore';
+      var targetPath = savedPath ? String(savedPath).replace(/^\/+/, '') : 'explore';
       if (targetPath === 'explore' || !targetPath) {
         window.history.replaceState(window.history.state, '', PANEL_BASE + 'explore');
       } else {
-        // 深层路径整页替换加载：入口文档内存里的探索页载荷会把地址拉回 /explore，
-        // 必须换成载荷剥离后的深层文档（服务端按路径剥离）才能正确恢复位置
-        window.location.replace(PANEL_BASE + targetPath);
+        // 深层路径：原本这里用 location.replace 整页替换加载（用户反馈「进来会再刷新一遍」）。
+        // 改成就地处理：在应用 bundle 之前把 SSR 载荷（data-nuxt-data）从 DOM 里摘掉，
+        // 效果与服务端对深层路径的剥离一致，再用 replaceState 改地址 —— 路由照常按
+        // 当前地址客户端渲染，不再重新加载整个页面。
+        try {
+          var pl = document.querySelector('script[data-nuxt-data="nuxt-app"]');
+          if (pl && pl.parentNode) pl.parentNode.removeChild(pl);
+        } catch (e2) { /* 忽略 */ }
+        try {
+          window.history.replaceState(window.history.state, '', PANEL_BASE + targetPath);
+        } catch (e2) {
+          window.location.replace(PANEL_BASE + targetPath);   // 极少数浏览器不允许改地址时才退回整页加载
+        }
+        // 兜底：万一应用启动后仍被载荷拉回探索页，再退回原来的整页替换
+        setTimeout(function () {
+          try {
+            if (window.location.pathname.indexOf(PANEL_BASE + targetPath) === -1) {
+              window.location.replace(PANEL_BASE + targetPath);
+            }
+          } catch (e2) { /* 忽略 */ }
+        }, 1500);
       }
     }
   } catch (e) { /* replaceState 失败则退回原地址，不阻断 */ }
+
+  // ---------- 定向静音：腾讯设备指纹 SDK（TDID / turingSdk）的固定报错 ----------
+  // 它的签发接口在镜像环境里被我们封锁（写操作都走 CLI，不需要设备标识），于是每次进频道
+  // 都会连打这几条 console.error 刷屏。这里只压这几条已知噪音，其它报错照常输出。
+  (function () {
+    var pats = ['[turingSdk]', 'turingSDK', 'initTuringSdk', 'deviceToken2SignToken', 'activate sign token'];
+    ['error', 'warn'].forEach(function (level) {
+      var orig = console[level];
+      if (typeof orig !== 'function') return;
+      console[level] = function () {
+        try {
+          var first = String(arguments.length ? arguments[0] : '');
+          for (var i = 0; i < pats.length; i++) {
+            if (first.indexOf(pats[i]) !== -1) return;
+          }
+        } catch (e) { /* 判断失败就照常输出 */ }
+        return orig.apply(console, arguments);
+      };
+    });
+  })();
 
   // ---------- document.cookie 清洗 + 虚拟会话 Cookie ----------
   // 1) 过滤 undefined/null 值对（外部统计脚本 parseCookie 会 trim 报错）
@@ -772,6 +810,7 @@
         ensureTopbarButtons();
         ensureNavEntries();
         syncPublishArea();
+        refreshJoinedAvatars();   // 官方「我的频道」晚一步渲染：定期回来把头补齐
         syncLikedMarks();
         ensureGuildMeta();
         ensureGatedFallback();
@@ -1139,6 +1178,59 @@
     });
   }
 
+  // 加入方式的展示名（与聊天指令层同一套）
+  var JOIN_TYPE_LABELS = {
+    JOIN_GUILD_TYPE_DIRECT: '直接加入',
+    JOIN_GUILD_TYPE_ADMIN_AUDIT: '管理员审核',
+    JOIN_GUILD_TYPE_DISABLE: '禁止加入',
+    JOIN_GUILD_TYPE_QUESTION_WITH_ADMIN_AUDIT: '提问审核',
+    JOIN_GUILD_TYPE_MULTI_QUESTION: '多题验证',
+    JOIN_GUILD_TYPE_MULTI_ANSWER_WITH_ADMIN_AUDIT: '多题验证',
+    JOIN_GUILD_TYPE_QUIZ: '测试题',
+  };
+  function joinTypeLabel(t) {
+    var raw = String(t || '').trim();
+    if (!raw) return '';
+    var compact = raw.replace(/_/g, '').toUpperCase();
+    for (var k in JOIN_TYPE_LABELS) {
+      if (k === raw || k.replace(/_/g, '').toUpperCase() === compact) return JOIN_TYPE_LABELS[k];
+    }
+    return raw;
+  }
+  // 需要答题的加入方式（题目在 setting.question.items 里）
+  function joinNeedsAnswers(t) {
+    var compact = String(t || '').replace(/_/g, '').toUpperCase();
+    return compact.indexOf('QUESTION') !== -1 || compact.indexOf('MULTI') !== -1 || compact.indexOf('QUIZ') !== -1;
+  }
+  function joinNeedsComment(t) {
+    var compact = String(t || '').replace(/_/g, '').toUpperCase();
+    return compact.indexOf('AUDIT') !== -1 || compact.indexOf('QUESTION') !== -1;
+  }
+  // 从加入方式里取题目（结构各家略有差异，尽量兼容）
+  function joinQuestionItems(setting) {
+    var box = (setting && (setting.question || setting.questions)) || {};
+    var items = box.items || box.question || box.list || [];
+    if (!Array.isArray(items)) items = [];
+    return items.map(function (it) {
+      if (typeof it === 'string') return { title: it, options: [] };
+      var title = (it && (it.title || it.question || it.content || it.text)) || '';
+      var opts = (it && (it.answers || it.options || it.answerList)) || [];
+      if (!Array.isArray(opts)) opts = [];
+      var options = opts.map(function (o) {
+        if (typeof o === 'string') return o;
+        return (o && (o.content || o.title || o.text || o.answer)) || '';
+      }).filter(function (x) { return !!x; });
+      return { title: String(title || ''), options: options };
+    }).filter(function (x) { return x.title || x.options.length; });
+  }
+  // 「加入」回复里是否在要附言 / 答题（CLI 用 need_verification，也会直接在文案里说）
+  function joinNeedsVerify(r) {
+    var d = (r && r.data && r.data.data) || {};
+    if (d && (d.need_verification || d.needVerification || d.pending)) return true;
+    var msg = String((r && r.message) || '') + ' ' + String(d.hint || '');
+    return /答题|附言|验证|需要回答/.test(msg);
+  }
+
   function openJoinFlow(guildNumber) {
     ensureMask();
     stopPoll();
@@ -1155,6 +1247,10 @@
       p.appendChild(el('span', { style: 'color:#222;font-size:14px;' }, val));
       return p;
     }
+    function fail(msg) {
+      stage.textContent = msg;
+      stage.style.color = '#e5484d';
+    }
     api('/cli', { method: 'POST', body: { action: 'search-guild', params: { keyword: guildNumber, scope: 'channel' } } }).then(function (r) {
       var channels = (r.data && r.data.data && r.data.data.channels) || [];
       var ch = null;
@@ -1162,44 +1258,178 @@
         if (String(channels[i].guild_number) === guildNumber) { ch = channels[i]; break; }
       }
       if (!r.success || !ch) {
-        stage.textContent = '未找到频道「' + guildNumber + '」' + (r.message ? '：' + r.message : '');
-        stage.style.color = '#e5484d';
+        fail('未找到频道「' + guildNumber + '」' + (r.message ? '：' + r.message : ''));
         return;
       }
-      stage.innerHTML = '';
-      stage.appendChild(line('频道', ch.name || guildNumber));
-      stage.appendChild(line('成员', String(ch.member_count != null ? ch.member_count : '?')));
-      if (ch.profile) stage.appendChild(line('简介', String(ch.profile).replace(/\s+/g, ' ').slice(0, 60)));
-      var joinBtn = el('button', { 'class': 'txpd-btn', type: 'button' }, '确认加入');
-      stage.appendChild(joinBtn);
-      var status = el('div', { style: 'font-size:13px;color:#2b64f5;margin-top:8px;min-height:18px;' });
-      stage.appendChild(status);
-      joinBtn.addEventListener('click', function () {
-        joinBtn.disabled = true;
-        joinBtn.textContent = '正在加入…';
-        api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } }).then(function (r2) {
-          if (r2.success) {
-            status.textContent = '✓ 已加入频道「' + (ch.name || guildNumber) + '」';
-            status.style.color = '#15a361';
-            joinBtn.textContent = '已完成';
-            invalidateAccounts();
-            invalidateGuilds();
+      // 加入方式：有的频道要附言 / 答题，先问清楚再加入（免得点了没反应就"加入成功"）
+      return api('/cli', { method: 'POST', body: { action: 'join-setting', params: { guild_id: ch.guild_id } } }).then(function (rs) {
+        var setting = ((rs.data && rs.data.data && rs.data.data.setting) || (rs.data && rs.data.data) || {});
+        var joinType = setting.joinType || setting.join_type || '';
+        var questions = joinQuestionItems(setting);
+
+        stage.innerHTML = '';
+        stage.style.color = '#333';
+        stage.appendChild(line('频道', ch.name || guildNumber));
+        stage.appendChild(line('成员', String(ch.member_count != null ? ch.member_count : '?')));
+        if (ch.profile) stage.appendChild(line('简介', String(ch.profile).replace(/\s+/g, ' ').slice(0, 60)));
+        if (joinTypeLabel(joinType)) stage.appendChild(line('加入方式', joinTypeLabel(joinType)));
+
+        // 输入区：题目（只读）+ 每题一个答案 + 附言（可选）
+        var form = el('div');
+        var answerInputs = [];
+        function buildForm() {
+          form.innerHTML = '';
+          form.style.cssText = 'margin-top:10px;';
+          if (questions.length) {
+            questions.forEach(function (q, idx) {
+              var qbox = el('div', { style: 'margin:10px 0 4px;' });
+              qbox.appendChild(el('div', { style: 'font-size:13px;color:#333;font-weight:600;' }, (questions.length > 1 ? (idx + 1) + '. ' : '') + (q.title || '请回答')));
+              if (q.options.length) {
+                qbox.appendChild(el('div', { style: 'font-size:12px;color:#888;margin-top:2px;' }, '可选：' + q.options.join(' / ')));
+              }
+              form.appendChild(qbox);
+              var inp = textInput(q.options.length ? '填写选项内容' : '填写答案', '');
+              answerInputs.push(inp);
+              form.appendChild(inp);
+            });
+          } else if (joinNeedsAnswers(joinType)) {
+            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '该频道需要答题验证，请填写答案（多题用换行分隔）：'));
+            var ta0 = areaInput('第一题的答案，第二题换行继续…', '', 68);
+            answerInputs.push(ta0);
+            form.appendChild(ta0);
+          }
+          if (joinNeedsComment(joinType)) {
+            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '附言（可不填）：'));
+            form.appendChild(commentInput);
+          }
+        }
+        var commentInput = areaInput('想对管理员说的话…', '', 54);
+        buildForm();
+        stage.appendChild(form);
+
+        var joinBtn = el('button', { 'class': 'txpd-btn', type: 'button' }, '确认加入');
+        if (String(joinType).replace(/_/g, '').toUpperCase().indexOf('DISABLE') !== -1) {
+          joinBtn.disabled = true;
+          joinBtn.textContent = '该频道禁止加入';
+        }
+        stage.appendChild(joinBtn);
+        var status = el('div', { style: 'font-size:13px;color:#2b64f5;margin-top:8px;min-height:18px;word-break:break-all;' });
+        stage.appendChild(status);
+
+        function collectedAnswers() {
+          var out = [];
+          answerInputs.forEach(function (inp) {
+            var v = String(inp.value || '');
+            v.split('\n').forEach(function (piece) {
+              var t = piece.trim();
+              if (t) out.push(t);
+            });
+          });
+          return out;
+        }
+        // 「成功」也要落地核对：CLI 有时乐观返回成功，实际没进频道（需要答题/附言/审核）。
+        // 用已加入列表反查一次（列表有延迟就重试），避免面板报一个假的「✓ 已加入」。
+        function checkJoined(retries) {
+          return loadJoinedGuilds().then(function (list) {
+            var want = numVariants(ch.guild_number).concat(ch.guild_id ? [String(ch.guild_id)] : []);
+            var hit = false;
+            (list || []).forEach(function (g) {
+              if (!g) return;
+              numVariants(g.guild_number).concat(g.guild_id ? [String(g.guild_id)] : []).forEach(function (k) {
+                if (k && want.indexOf(k) !== -1) hit = true;
+              });
+            });
+            if (hit) return true;
+            if (retries > 0) {
+              return new Promise(function (res) { setTimeout(res, 1200); }).then(function () {
+                invalidateGuilds();
+                return checkJoined(retries - 1);
+              });
+            }
+            return false;
+          }).catch(function () { return true; });   // 列表拉不到时不误报「没加入」
+        }
+        function ensureVerifyInputs() {
+          if (!answerInputs.length && !questions.length) {
+            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '该频道需要答题验证，请填写答案（多题用换行分隔）：'));
+            answerInputs.push(areaInput('填写答案…', '', 68));
+            form.appendChild(answerInputs[answerInputs.length - 1]);
+          }
+          if (!commentInput.parentNode) {
+            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '附言（可不填）：'));
+            form.appendChild(commentInput);
+          }
+        }
+        function submit() {
+          var answers = collectedAnswers();
+          var comment = String(commentInput.value || '').trim();
+          joinBtn.disabled = true;
+          joinBtn.textContent = '正在加入…';
+          var req;
+          if (!answers.length && !comment) {
+            // 没有要填的：直接加入
+            req = api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } });
           } else {
-            status.textContent = r2.message || '加入失败';
+            var stdin = { guild_id: ch.guild_id };
+            if (answers.length) stdin.join_guild_answers = answers.map(function (a) { return { answer: a }; });
+            if (comment) stdin.join_guild_comment = comment;
+            req = api('/cli', { method: 'POST', body: { action: 'join-guild-verify', params: { guild_id: ch.guild_id }, stdin: stdin } });
+          }
+          req.then(function (r2) {
+            if (!r2.success) {
+              // 还缺附言 / 答案：把输入区摆出来，并把上游原话贴出来
+              if (joinNeedsVerify(r2)) {
+                ensureVerifyInputs();
+                status.textContent = r2.message ? ('还需要验证：' + r2.message) : '还需要验证：请填写附言 / 答案后再试';
+                status.style.color = '#e5484d';
+                joinBtn.disabled = false;
+                joinBtn.textContent = '提交验证';
+                toast('该频道需要答题 / 附言验证');
+                return null;
+              }
+              status.textContent = r2.message || '加入失败';
+              status.style.color = '#e5484d';
+              joinBtn.disabled = false;
+              joinBtn.textContent = '重试加入';
+              return null;
+            }
+            // 上游说成功 → 再核对一次是否真的进了频道
+            invalidateGuilds();
+            return checkJoined(2).then(function (joined) {
+              if (!joined) {
+                ensureVerifyInputs();
+                status.textContent = '上游返回成功，但账号还没出现在该频道的已加入列表：可能仍需答题 / 附言，或等待管理员审核'
+                  + (r2.message ? '（上游：' + r2.message + '）' : '');
+                status.style.color = '#e5484d';
+                joinBtn.disabled = false;
+                joinBtn.textContent = '补充验证后再试';
+                toast('加入可能未生效，请补充验证后重试');
+                return;
+              }
+              status.textContent = '✓ 已加入频道「' + (ch.name || guildNumber) + '」';
+              status.style.color = '#15a361';
+              joinBtn.textContent = '已完成';
+              try { queueUiSync(); } catch (e) { /* 忽略 */ }
+              setTimeout(ensureGuildMeta, 0);
+              toast('✓ 已加入频道「' + (ch.name || guildNumber) + '」');
+            });
+          }).catch(function (e) {
+            status.textContent = String((e && e.message) || '网络错误，请重试');
             status.style.color = '#e5484d';
             joinBtn.disabled = false;
             joinBtn.textContent = '重试加入';
-          }
-        }).catch(function () {
-          status.textContent = '网络错误，请重试';
-          status.style.color = '#e5484d';
-          joinBtn.disabled = false;
-          joinBtn.textContent = '重试加入';
+          });
+        }
+        joinBtn.addEventListener('click', submit);
+        // 需要答题的频道：直接按回车提交第一个输入框也算提交
+        answerInputs.forEach(function (inp) {
+          inp.addEventListener('keydown', function (e2) {
+            if (e2.key === 'Enter' && !e2.shiftKey && inp.tagName === 'INPUT') { e2.preventDefault(); submit(); }
+          });
         });
       });
     }).catch(function () {
-      stage.textContent = '网络错误，请重试';
-      stage.style.color = '#e5484d';
+      fail('网络错误，请重试');
     });
   }
 
@@ -1317,22 +1547,107 @@
 
   // 官方侧栏里同一频道的头像地址（带官方参数，能正常加载）；找不到就返回空
   function officialAvatarOf(g) {
-    var gid = String((g && g.guild_id) || '');
-    var name = String((g && g.name) || '').trim();
+    if (!g) return '';
+    var gid = String(g.guild_id || '');
+    var name = String(g.name || '').trim();
+    var nameBare = name.replace(/频道$/, '').trim();
+    var nums = numVariants(g.guild_number);
+    if (gid) nums = nums.concat(numVariants(gid));
     var groups = ['.aside-group--my-guild', '.aside-group--my-temp-guild'];
     for (var gi = 0; gi < groups.length; gi++) {
       var items = document.querySelectorAll(groups[gi] + ' .my-guild-item');
       for (var i = 0; i < items.length; i++) {
-        var img = items[i].querySelector('img');
+        var it = items[i];
+        var img = it.querySelector('img');
         var src = img ? (img.getAttribute('src') || '') : '';
-        if (!src) continue;
+        // 懒加载的图先给 data:/占位地址，真实地址在 data-src 上
+        if (img && !/^https?:/i.test(src)) {
+          src = img.getAttribute('data-src') || img.getAttribute('data-original') || src;
+        }
+        if (!src || !/^https?:/i.test(src)) continue;
         if (gid && src.indexOf('/' + gid + '/') !== -1) return src;
-        var nameEl = items[i].querySelector('.item-name');
+        // 频道号：官方条目的链接 / 头像地址里都带得出来（两套编码都试）
+        var link = it.querySelector('a[href]');
+        var href = link ? (link.getAttribute('href') || '') : '';
+        var hay = href + ' ' + src + ' ' + (it.getAttribute('data-gnum') || '');
+        for (var k = 0; k < nums.length; k++) {
+          if (nums[k] && hay.indexOf(nums[k]) !== -1) return src;
+        }
+        var nameEl = it.querySelector('.item-name');
         var n = nameEl ? (nameEl.textContent || '').trim() : '';
-        if (name && n && n === name) return src;
+        if (name && n && (n === name || n.replace(/频道$/, '').trim() === nameBare)) return src;
       }
     }
     return '';
+  }
+
+  // 头像地址：官方侧栏那份优先（带官方参数）；其次用 CLI 返回的头像地址；
+  // 都没有才用首字占位。拼出来的 gtimg 直链会 403/协议错误，所以只认接口给的字符串。
+  var AVATAR_FIELDS = ['avatar_url', 'avatarUrl', 'avatar', 'guild_avatar', 'guild_avatar_url', 'guildAvatar', 'icon', 'guild_icon'];
+  function joinedAvatarUrl(g) {
+    var official = officialAvatarOf(g);
+    if (official) return official;
+    for (var i = 0; i < AVATAR_FIELDS.length; i++) {
+      var v = g && g[AVATAR_FIELDS[i]];
+      if (typeof v === 'string' && /^https?:\/\//i.test(v)) return v;
+    }
+    return '';
+  }
+  // 把头像画进一行（已经有图就不动）
+  var _avatarFailedAt = {};   // 加载失败的地址 → 时间戳：10 分钟内不再重试，免得同步循环里反复发请求
+  function avatarUsable(url) {
+    var t = _avatarFailedAt[url];
+    return !t || (Date.now() - t) > 600000;
+  }
+  function paintJoinedAvatar(item, g) {
+    var wrap = item.querySelector('.item-avatar-wrap');
+    if (!wrap) return;
+    if (wrap.querySelector('img.item-avatar')) return;
+    var url = joinedAvatarUrl(g);
+    if (!url || !avatarUsable(url)) return;            // 拿不到：留着占位，下次同步再试
+    var img = el('img', {
+      'class': 'item-avatar',
+      'src': url,
+      'alt': g.name || '',
+      'loading': 'lazy',
+      'referrerpolicy': 'no-referrer',
+    });
+    img.addEventListener('error', function () {
+      // 官方那份地址也可能过期：记下失败、撤掉图，回到首字占位（10 分钟后再试）
+      _avatarFailedAt[url] = Date.now();
+      if (img.parentNode) img.parentNode.removeChild(img);
+      if (wrap && !wrap.querySelector('.txpd-avatar-ph')) {
+        wrap.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
+      }
+    });
+    var ph = wrap.querySelector('.txpd-avatar-ph');
+    if (ph && ph.parentNode) ph.parentNode.removeChild(ph);
+    wrap.appendChild(img);
+  }
+  // 官方「我的频道」是异步渲染的，插件这份列表常常先画出来（那时官方条目还不存在，
+  // 只能退化成首字占位）。以前只在建列表时取一次头像，取不到就永远是占位——
+  // 用户看到的就是「已加入的频道不显示头像/表情」。所以每轮同步都回头补一遍。
+  function refreshJoinedAvatars() {
+    var items = document.querySelectorAll('.aside-group--txpd-joined .my-guild-item');
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.querySelector('img.item-avatar')) continue;
+      var g = it._txpdGuild;
+      if (!g) {
+        var gnum = it.getAttribute('data-gnum') || '';
+        var keys = numVariants(gnum);
+        if (_guildsCache) {
+          for (var j = 0; j < _guildsCache.length && !g; j++) {
+            var cand = _guildsCache[j];
+            var ck = numVariants(cand.guild_number).concat(cand.guild_id ? [String(cand.guild_id)] : []);
+            for (var k = 0; k < ck.length; k++) {
+              if (keys.indexOf(ck[k]) !== -1) { g = cand; break; }
+            }
+          }
+        }
+      }
+      if (g) paintJoinedAvatar(it, g);
+    }
   }
 
   // 官方同款占位：昵称首字 + 主题色底
@@ -1396,25 +1711,12 @@
           'title': (g.name || '') + '（' + (g.role || '成员') + '），点击进入频道',
         });
         var av = el('div', { 'class': 'item-avatar-wrap' });
-        // 头像地址优先取官方同频道的（带它们的鉴权参数）；自己拼的 gtimg 直链会 403/协议错误，
-        // 控制台还会把失败记在插件头上，所以拿不到就干脆不发请求，用官方同款占位。
-        var avUrl = officialAvatarOf(g);
-        if (avUrl) {
-          var img = el('img', {
-            'class': 'item-avatar',
-            'src': avUrl,
-            'alt': g.name || '',
-            'loading': 'lazy',
-            'referrerpolicy': 'no-referrer',
-          });
-          img.addEventListener('error', function () { img.style.display = 'none'; });
-          av.appendChild(img);
-        } else {
-          av.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
-        }
+        item._txpdGuild = g;   // 头像要反复补（官方那份异步渲染），这里留着数据源的引用
+        av.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
         item.appendChild(av);
         item.appendChild(el('div', { 'class': 'item-name ellipsis' }, g.name || g.guild_number || ''));
         item.addEventListener('click', function () { openGuildView(g); });
+        paintJoinedAvatar(item, g);   // 拿得到地址就直接上真头像（官方参数 / CLI 头像）
         wrap.appendChild(item);
         list2.appendChild(wrap);
       });
@@ -2637,33 +2939,46 @@
   }
 
   // ---------- 发帖修复：已加入频道隐藏「登录后…」+ 接管「发表」为 CLI ----------
+  // 应用的官方编辑器对「网页账号没登录 / 没加入频道」的访客是**不展开**的（点表情图标、
+  // 点输入区都只会弹它的登录/加入引导），所以只要 CLI 账号在频道里，就一律由插件接管：
+  // 点击发布卡 → 展开插件自己的编辑器（发表走 CLI），从而绕开官方那条走不通的路。
+  function hookPublishArea(container) {
+    if (!container || container.getAttribute('data-txpd-hooked') === '1') return;
+    container.setAttribute('data-txpd-hooked', '1');
+    // 捕获阶段挂在容器（祖先）上：应用自己的处理器在目标元素上，捕获先于它触发
+    container.addEventListener('click', function (e) {
+      if (container.getAttribute('data-txpd-expanded') === '1') return;   // 已展开：交给编辑器自己
+      var t = e.target;
+      if (t && t.closest && t.closest('[data-txpd-editor-added]')) return;
+      var emojiIcon = t && t.closest ? t.closest('.toolbar-button .icon-emoji') : null;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+      expandPublishEditor(container);
+      // 点的是表情图标：展开后顺手把表情面板弹出来，点一次就能用
+      if (emojiIcon && container._txpdInsertEmoji) {
+        var icon = container.querySelector('[data-txpd-editor-added] .toolbar-button .icon-emoji') || emojiIcon;
+        openEmojiPicker(icon.closest('.toolbar-button') || icon, function (item) {
+          container._txpdInsertEmoji(container.querySelector('[data-txpd-content]'), item);
+        });
+      }
+    }, true);
+  }
   function syncPublishArea() {
     var ctx = currentGuild();
+    var containers = publishAreaContainers();
+    if (!containers.length) return;
+    containers.forEach(hookPublishArea);
     var joined = !!(ctx.num && _joinedKeys && _joinedKeys[ctx.num]);
-    var container = document.querySelector('.publish-editor-container');
+    // _joinedKeys 还没拉到 → 状态未知，先别动（之前这里当成「没加入」会把刚展开的编辑器
+    // 收掉，用户正打字就没了，表现为点了没反应 / 发不出去）
+    var unknown = (_joinedKeys === null || _joinedKeys === undefined);
+    var container = visiblePublishContainer();
     if (!container) return;
-    if (!joined) {
-      // 未加入频道：恢复官方行为（移除接管标记，并把我们展开的编辑器收掉、官方节点恢复显示）
-      if (container.getAttribute('data-txpd-hooked')) container.removeAttribute('data-txpd-hooked');
-      if (container.getAttribute('data-txpd-expanded') === '1') collapsePublishEditor();
-      return;
-    }
     var hint = container.querySelector('.editor-header .user-name');
-    if (hint) hint.textContent = '发帖将以 CLI 当前账号身份发表，点击输入框开始';
-    // 关键：捕获监听挂在容器（祖先）上——应用自己的处理器注册更早，
-    // 挂在按钮同元素上会因顺序输掉；祖先捕获可先于目标元素触发并阻断
-    if (!container.getAttribute('data-txpd-hooked')) {
-      container.setAttribute('data-txpd-hooked', '1');
-      container.addEventListener('click', function (e) {
-        // 已展开：放行（内联编辑器自身阻止冒泡）
-        if (container.getAttribute('data-txpd-expanded') === '1') return;
-        var insideMyEditor = e.target && e.target.closest && e.target.closest('.txpd-inline-editor');
-        if (insideMyEditor) return;
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        e.stopPropagation();
-        expandPublishEditor();
-      }, true);
+    if (hint && joined) hint.textContent = '发帖将以 CLI 当前账号身份发表，点击输入框开始';
+    if (!joined && !unknown && container.getAttribute('data-txpd-expanded') === '1') {
+      collapsePublishEditor(container);   // 明确没加入：收起，交还官方节点
     }
   }
   // ---------- 点赞状态：本地持久化 + 计数 +1 / 取消 ----------
@@ -3073,11 +3388,12 @@
   // ---------- 内联发帖编辑器（复刻官方：点击发布卡原地下拉展开） ----------
   var _pubImages = [];
 
-  function collapsePublishEditor() {
+  function collapsePublishEditor(container) {
     // 把我们追加的编辑器摘掉、官方子节点恢复显示（展开时只隐藏、没删）
-    var container0 = document.querySelector('.publish-editor-container');
-    if (container0) {
-      Array.prototype.forEach.call(Array.prototype.slice.call(container0.children), function (ch) {
+    var targets = container ? [container] : publishAreaContainers();
+    Array.prototype.forEach.call(targets, function (box) {
+      if (!box) return;
+      Array.prototype.forEach.call(Array.prototype.slice.call(box.children), function (ch) {
         if (ch.getAttribute && ch.getAttribute('data-txpd-hidden-editor') === '1') {
           if (ch.style) ch.style.removeProperty('display');
           ch.removeAttribute('data-txpd-hidden-editor');
@@ -3085,15 +3401,23 @@
           ch.parentNode.removeChild(ch);   // 只摘我们自己插进去的节点
         }
       });
-      container0.removeAttribute('data-txpd-expanded');
+      box.removeAttribute('data-txpd-expanded');
+    });
+    _pubImages = [];
+  }
+
+  // 页面上可能同时有两个发布卡：应用自己的（view-g-home 里）+ 插件为访客频道搭的骨架。
+  // document.querySelector 只拿第一个，可能正好是隐藏的那个——工作挂上去就变成
+  // 「点了没反应 / 发不出去」。所以统一按「可见的优先」来选。
+  function publishAreaContainers() {
+    return Array.prototype.slice.call(document.querySelectorAll('.publish-editor-container'));
+  }
+  function visiblePublishContainer() {
+    var all = publishAreaContainers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getClientRects().length) return all[i];
     }
-    var container = document.querySelector('.publish-editor-container');
-    if (!container) return;
-    var ed = container.querySelector('.txpd-inline-editor');
-    if (ed) ed.parentNode.removeChild(ed);
-    var area = container.querySelector('.editor-area');
-    if (area) area.style.display = '';
-    container.removeAttribute('data-txpd-expanded');
+    return all[0] || null;
   }
 
   function escHtml(s) {
@@ -3109,9 +3433,17 @@
   var OFFICIAL_COMPOSER_HTML = "<div class=\"editor-area\" data-v-1c099b7e><div class=\"editor-header pointer\" data-v-1c099b7e><div class=\"user-info\" data-v-1c099b7e><img src=\"https://qqchannel-profile-1251316161.file.myqcloud.com/wxxcxdefault\" class=\"avatar\" alt=\"\" data-v-1c099b7e><span class=\"user-name\" data-v-1c099b7e>\u53d1\u5e16\u5c06\u4ee5 CLI \u5f53\u524d\u8d26\u53f7\u8eab\u4efd\u53d1\u8868\uff0c\u70b9\u51fb\u6b64\u5904\u8f93\u5165</span></div><div class=\"toolbar-area\" data-v-1c099b7e><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-emoji\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#emoji\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-at\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#at\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-image\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#image\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg width=\"20\" height=\"20\" class=\"icon-svg\" viewbox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\" data-v-1c099b7e><path d=\"M10.078 13.797C9.60006 13.4587 8.96861 13.0501 8.43374 12.8338C7.26763 12.3622 5.6115 12.4205 4.38399 12.5621C3.53188 12.6605 2.72986 12.0143 2.72986 11.1565C2.72986 9.83204 2.72986 8.72527 2.72986 7.38215C2.72986 6.57948 3.43379 5.95326 4.23474 6.00586C5.4523 6.08583 7.16672 6.12682 8.43374 5.86935C10.1696 5.51659 12.1915 4.37484 13.7037 3.38356C14.641 2.76907 15.9691 3.42615 15.9691 4.54697C15.9691 6.31738 15.9691 7.78715 15.9691 9.88398\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\" stroke-linecap=\"square\"></path><path d=\"M7.03646 12.4248L7.91263 15.3797C8.1828 16.2908 7.50008 17.2053 6.54973 17.2053V17.2053C5.92028 17.2053 5.36578 16.7914 5.18683 16.1879L4.071 12.4248\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\"></path><path d=\"M14.6181 11.8909C14.7569 11.5392 15.2546 11.5392 15.3934 11.8909L16.0345 13.5165C16.0769 13.6239 16.1619 13.7089 16.2693 13.7513L17.8949 14.3924C18.2467 14.5312 18.2467 15.0289 17.8949 15.1677L16.2693 15.8088C16.1619 15.8512 16.0769 15.9362 16.0345 16.0436L15.3934 17.6692C15.2546 18.0209 14.7569 18.0209 14.6181 17.6692L13.977 16.0436C13.9346 15.9362 13.8496 15.8512 13.7423 15.8088L12.1166 15.1677C11.7649 15.0289 11.7649 14.5312 12.1166 14.3924L13.7423 13.7513C13.8496 13.7089 13.9346 13.6239 13.977 13.5165L14.6181 11.8909Z\" fill=\"currentColor\" style=\"fill:currentColor;fill-opacity:1;\"></path></svg></span><!--]--><!----><!--]--><!----><!--[--><!--[--><!--]--><!----><!--]--><span data-v-1c099b7e></span></div></div><div class=\"editor-divider\" data-v-1c099b7e></div><div class=\"editor-root-container\" data-v-1c099b7e><div class=\"ProseMirror\" contenteditable=\"true\" data-txpd-content data-v-1c099b7e></div></div><div class=\"upload-area\" data-v-1c099b7e><div class=\"upload-left\" data-v-1c099b7e><!--[--><div class=\"image-video-container\" data-v-90ae7ef7><div class=\"preview-list\" data-v-90ae7ef7><!----><!----><div class=\"upload-button\" style=\"top:0;left:0;\" data-v-90ae7ef7><svg class=\"icon-svg-symbol icon-add-upload\" style=\"color:currentColor;width:36px;height:36px;\" data-v-90ae7ef7><use xlink:href=\"assets/common.svg#add-upload\"></use></svg></div></div></div><!----><!--]--><!----></div><div class=\"bottom-bar\" data-v-1c099b7e><div class=\"word-count\" data-v-1c099b7e>0/1000</div><div class=\"chose-channel\" data-v-1c099b7e><button class=\"g-button g-button--default g-button--small chose-channel-btn\" style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--><!----> \u4e0d\u9009\u62e9\u7248\u5757 <svg class=\"icon-svg-symbol icon-arrow-right\" style=\"color:currentColor;width:10px;height:10px;margin-left:4px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#arrow-right\"></use></svg><!--]--></button></div><!----><div class=\"publish-button\" data-v-1c099b7e><button class=\"g-button g-button--primary g-button--small btn\" disabled style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--> \u53d1\u8868<!--]--></button></div></div></div></div>";
 
 
-  function expandPublishEditor() {
-    var container = document.querySelector('.publish-editor-container');
-    if (!container || container.getAttribute('data-txpd-expanded') === '1') return;
+  function expandPublishEditor(container) {
+    container = container || visiblePublishContainer();
+    if (!container) return;
+    var already = container.querySelector('[data-txpd-editor-added]');
+    if (container.getAttribute('data-txpd-expanded') === '1' && already) return;
+    // 标记丢了但我们的节点还在（路由/频道切换后官方重建过）→ 先清残留再重铺
+    Array.prototype.forEach.call(Array.prototype.slice.call(container.children), function (ch) {
+      if (ch.getAttribute && ch.getAttribute('data-txpd-editor-added') === '1' && ch.parentNode) {
+        ch.parentNode.removeChild(ch);
+      }
+    });
     container.setAttribute('data-txpd-expanded', '1');
     // 官方编辑器自己也在往这个容器里建视图，直接把 innerHTML 换掉会让它的 createView
     // 找不到节点而抛错（Cannot set properties of null）。所以：官方的子节点**只隐藏**，
@@ -3141,13 +3473,44 @@
     var previewList = container.querySelector('.preview-list');
     var userName = container.querySelector('.user-name');
     if (userName) userName.textContent = '发帖将以 CLI 当前账号身份发表，点击下方输入';
-    var _pubImages = [];
+    // 状态/报错行。以前这里没有对应节点，status 落到了 window.status（一个字符串）上，
+    // 于是「正在发表…」「上游原始报错」全都看不见 —— 用户只能看到什么都没发生。
+    var status = el('div', { 'class': 'txpd-pub-status' });
+    status.style.cssText = 'font-size:13px;color:#888;padding:0 12px 8px;min-height:18px;word-break:break-all;';
+    var areaEl0 = container.querySelector('.editor-area');
+    if (areaEl0) areaEl0.appendChild(status); else container.appendChild(status);
+    function setStatus(text, color) {
+      status.textContent = text || '';
+      status.style.color = color || '#888';
+    }
     var chosen = null;
     function updatePubState() {
       if (!pubBtn) return;
       var has = (contentEl && (contentEl.textContent || '').trim().length > 0) || _pubImages.length > 0;
       pubBtn.disabled = !has;
     }
+    // 表情插入：普通 emoji 直接插文本，表情包插带 data-emj 的图片芯片，
+    // 提交时由 serializeComposerContent 还原成官方节点语法
+    function insertPubEmoji(ce, item) {
+      if (!ce) return;
+      ce.focus();
+      if (String(item[2]) === '2') {
+        insertNodeAtCaret(ce, document.createTextNode(String(item[0])));
+      } else {
+        insertNodeAtCaret(ce, el('img', {
+          src: emojiImgUrl(item[0], item[2]),
+          'data-emj': emojiInsertText(item),
+          title: item[1],
+          style: 'width:22px;height:22px;vertical-align:-4px;margin:0 1px;',
+        }));
+      }
+      var area = ce.closest ? ce.closest('.editor-area') : null;
+      var wc = area ? area.querySelector('.word-count') : null;
+      if (wc) wc.textContent = Math.min((ce.textContent || '').length, 1000) + '/1000';
+      if (ce === contentEl) updatePubState();
+    }
+    // 给「收起状态点表情图标」用：展开函数外也能插入表情
+    container._txpdInsertEmoji = insertPubEmoji;
     if (contentEl) {
       contentEl.setAttribute('contenteditable', 'true');
       contentEl.style.cssText = 'min-height:72px;outline:none;font-size:14px;line-height:1.6;padding:8px 4px;word-break:break-word;';
@@ -3186,39 +3549,47 @@
       });
       fileInput.value = '';
     });
-    // 官方工具栏表情图标 → 表情选择器（插入表情芯片，发布时序列化回节点语法）
-    var emojiTbIcon = container.querySelector('.toolbar-button .icon-emoji');
-    if (emojiTbIcon) {
-      var emojiTb = emojiTbIcon.closest('.toolbar-button');
-      if (emojiTb) emojiTb.addEventListener('click', function (e) {
+    // 工具栏表情图标 → 表情选择器
+    // 用事件委托（而不是 querySelector 抓那一个节点）：官方重建节点、或页面上同时
+    // 存在两个发布卡时，点的那个图标一样能弹出选择器。捕获阶段拦下，免得落到应用的
+    // 官方处理器（访客态下它只会弹登录/加入引导，什么都不显示）。
+    if (container.getAttribute('data-txpd-emoji-wired') !== '1') {
+      container.setAttribute('data-txpd-emoji-wired', '1');
+      container.addEventListener('click', function (e) {
+        var ic = e.target && e.target.closest ? e.target.closest('.toolbar-button .icon-emoji') : null;
+        if (!ic) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
         e.stopPropagation();
-        openEmojiPicker(emojiTb, function (item) {
-          if (String(item[2]) === '2') {
-            contentEl.focus();
-            insertNodeAtCaret(contentEl, document.createTextNode(String(item[0])));
-          } else {
-            var chip = el('img', {
-              src: emojiImgUrl(item[0], item[2]),
-              'data-emj': emojiInsertText(item),
-              title: item[1],
-              style: 'width:22px;height:22px;vertical-align:-4px;margin:0 1px;',
-            });
-            contentEl.focus();
-            insertNodeAtCaret(contentEl, chip);
-          }
-          updatePubState();
-        });
-      });
+        var anchor = ic.closest('.toolbar-button') || ic;
+        var host = ic.closest('.publish-editor-container') || container;
+        var ce = host.querySelector('[data-txpd-content]') || contentEl;
+        openEmojiPicker(anchor, function (item) { insertPubEmoji(ce, item); });
+      }, true);
     }
-    // 官方工具栏图片图标也触发选图
-    var imgTb = container.querySelector('.toolbar-button .icon-image');
-    if (imgTb) {
-      var tbWrap = imgTb.closest('.toolbar-button');
-      if (tbWrap) tbWrap.addEventListener('click', function (e) { e.stopPropagation(); fileInput.click(); });
+    // 工具栏图片图标也触发选图（同样委托）
+    if (container.getAttribute('data-txpd-image-wired') !== '1') {
+      container.setAttribute('data-txpd-image-wired', '1');
+      container.addEventListener('click', function (e) {
+        var ic = e.target && e.target.closest ? e.target.closest('.toolbar-button .icon-image') : null;
+        if (!ic) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+        fileInput.click();
+      }, true);
     }
     // 版块选择下拉（chose-channel 按钮）
     var channels = [];
-    loadGuildChannels({ guild_id: ctx.id }).then(function (chs) { channels = chs; }).catch(function () { /* 忽略 */ });
+    var channelsLoaded = false;
+    function loadChannels() {
+      return loadGuildChannels({ guild_id: ctx.id }).then(function (chs) {
+        channels = chs || [];
+        channelsLoaded = true;
+        return channels;
+      }).catch(function () { channelsLoaded = true; return channels; });
+    }
+    loadChannels();
     if (choseBtn) {
       choseBtn.addEventListener('click', function (e) {
         e.stopPropagation();
@@ -3226,21 +3597,37 @@
         if (exist) { exist.parentNode.removeChild(exist); return; }
         var dd = el('div', { 'class': 'txpd-channel-dropdown' });
         dd.style.cssText = 'position:absolute;bottom:52px;right:12px;background:#fff;border:1px solid #e5e5e5;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.14);z-index:20;min-width:170px;max-height:230px;overflow:auto;';
-        if (!channels.length) dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '版块加载中…'));
-        channels.forEach(function (ch) {
-          var row = el('div', { style: 'padding:8px 12px;font-size:13px;cursor:pointer;color:#222;' }, ch.channel_name || ch.channel_id);
-          row.addEventListener('mouseenter', function () { row.style.background = '#f2f4f8'; });
-          row.addEventListener('mouseleave', function () { row.style.background = ''; });
-          row.addEventListener('click', function () {
-            chosen = ch;
-            for (var i = 0; i < choseBtn.childNodes.length; i++) {
-              var n = choseBtn.childNodes[i];
-              if (n.nodeType === 3 && n.textContent.trim()) { n.textContent = ' ' + (ch.channel_name || ''); break; }
-            }
-            dd.parentNode.removeChild(dd);
+        function paint() {
+          dd.innerHTML = '';
+          if (!channelsLoaded) { dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '版块加载中…')); return; }
+          if (!channels.length) {
+            // 拉不到版块也要能发帖：官方「不选择版块」本来就是合法状态
+            dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '没读到版块（可直接发表）'));
+            var retry = el('div', { style: 'padding:8px 12px;font-size:13px;cursor:pointer;color:#2b64f5;' }, '重新加载');
+            retry.addEventListener('click', function (ev) {
+              ev.stopPropagation();
+              channelsLoaded = false; paint(); loadChannels().then(paint);
+            });
+            dd.appendChild(retry);
+            return;
+          }
+          channels.forEach(function (ch) {
+            var row = el('div', { style: 'padding:8px 12px;font-size:13px;cursor:pointer;color:#222;' }, ch.channel_name || ch.channel_id);
+            row.addEventListener('mouseenter', function () { row.style.background = '#f2f4f8'; });
+            row.addEventListener('mouseleave', function () { row.style.background = ''; });
+            row.addEventListener('click', function () {
+              chosen = ch;
+              for (var i = 0; i < choseBtn.childNodes.length; i++) {
+                var n = choseBtn.childNodes[i];
+                if (n.nodeType === 3 && n.textContent.trim()) { n.textContent = ' ' + (ch.channel_name || ''); break; }
+              }
+              dd.parentNode.removeChild(dd);
+            });
+            dd.appendChild(row);
           });
-          dd.appendChild(row);
-        });
+        }
+        paint();
+        if (!channelsLoaded) loadChannels().then(paint);
         choseBtn.parentNode.style.position = 'relative';
         choseBtn.parentNode.appendChild(dd);
       });
@@ -3250,16 +3637,15 @@
       e.stopPropagation();
       var content = serializeComposerContent(contentEl).trim();
       if (!content && !_pubImages.length) return;
-      if (!chosen) { panelError(status, '请先选择版块'); status.style.color = '#e5484d'; return; }
+      // 版块是可选参数（官方也有「不选择版块」）：拉不到版块列表时不再把人卡死，
+      // 真需要版块的频道由上游返回它自己的报错，原样显示
       if (content.length > 1000) { panelError(status, '内容超过 1000 字'); return; }
       pubBtn.disabled = true;
-      status.style.color = '#888';
       var doPublish = function (imagePaths) {
-        status.textContent = '正在发表…';
-        api('/publish', { method: 'POST', body: { guild_id: ctx.id, channel_id: chosen.channel_id, content: content, images: imagePaths, format: 'text', user: TXPD_USER } }).then(function (r) {
+        setStatus('正在发表…');
+        api('/publish', { method: 'POST', body: { guild_id: ctx.id, channel_id: chosen ? chosen.channel_id : '', content: content, images: imagePaths, format: 'text', user: TXPD_USER } }).then(function (r) {
           if (!r.success) throw new Error(r.message || '发表失败');
-          status.textContent = '✓ 已发表';
-          status.style.color = '#15a361';
+          setStatus('✓ 已发表', '#15a361');
           contentEl.innerHTML = '';
           _pubImages = []; chosen = null; renderThumbs();
           if (wordCount) wordCount.textContent = '0/1000';
@@ -3268,11 +3654,11 @@
             if (n.nodeType === 3 && n.textContent.trim()) { n.textContent = ' 不选择版块'; break; }
           }
           updatePubState();
-          setTimeout(function () { if (status.textContent === '✓ 已发表') status.textContent = ''; }, 2500);
+          setTimeout(function () { if (status.textContent === '✓ 已发表') setStatus(''); }, 2500);
         }).catch(function (e) { panelError(status, e.message); pubBtn.disabled = false; });
       };
       if (!_pubImages.length) { doPublish([]); return; }
-      status.textContent = '正在上传图片 0/' + _pubImages.length + '…';
+      setStatus('正在上传图片 0/' + _pubImages.length + '…');
       var paths = [], failed = false;
       (function next(idx) {
         if (failed) return;
@@ -4797,6 +5183,7 @@
       ensureTopbarButtons();
       ensureNavEntries();
       syncPublishArea();
+      refreshJoinedAvatars();   // 官方「我的频道」晚一步渲染：每轮回来把头补齐
       ensureMobileBackButton();
       ensureNarrowDrawer();
       syncLikedMarks();

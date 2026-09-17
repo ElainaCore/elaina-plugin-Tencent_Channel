@@ -287,14 +287,18 @@ def record_history(entry: Dict[str, Any]) -> None:
         pass
 
 
-def normalize_schedule(body: Dict[str, Any]) -> Dict[str, Any]:
-    """校验并规范化一条计划任务，返回 {'error': ...} 或规范化后的任务。"""
+def normalize_schedule(body: Dict[str, Any], require_channel: bool = True) -> Dict[str, Any]:
+    """校验并规范化一条计划任务，返回 {'error': ...} 或规范化后的任务。
+
+    require_channel=False 只用于「立即发帖」：官方发帖框本来就有「不选择版块」这一态，
+    CLI 的 --channel-id 也是可选项，缺省时由上游按频道默认版块处理。
+    """
     cron = str(body.get("cron") or "").strip()
     if not cron_valid(cron):
         return {"error": "Cron 表达式无效，需为 5 段：分 时 日 月 周（支持 * , - /）"}
     guild_id = str(body.get("guild_id") or "").strip()
     channel_id = str(body.get("channel_id") or "").strip()
-    if not guild_id or not channel_id:
+    if not guild_id or (require_channel and not channel_id):
         return {"error": "必须填写频道ID (guild_id) 和版块ID (channel_id)"}
     content = str(body.get("content") or "").strip()
     if not content:
@@ -336,9 +340,11 @@ def build_publish_args(schedule: Dict[str, Any]) -> List[str]:
         "publish-feed",
         "--guild-id",
         str(schedule["guild_id"]),
-        "--channel-id",
-        str(schedule["channel_id"]),
     ]
+    # 版块可选：官方「不选择版块」发帖时 channel_id 为空，交给上游默认版块
+    channel_id = str(schedule.get("channel_id") or "").strip()
+    if channel_id:
+        args += ["--channel-id", channel_id]
     title = str(schedule.get("title") or "").strip()
     if title:
         args += ["--title", title]
