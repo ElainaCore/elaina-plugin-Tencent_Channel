@@ -359,23 +359,33 @@
   }
 
   var mask, dlg, pollTimer = null;
+  var _dlgShownAt = 0;
 
   function ensureMask() {
     if (mask) return;
     mask = el('div', { id: 'txpd-acct-mask' });
     dlg = el('div', { id: 'txpd-acct-dlg' });
     mask.appendChild(dlg);
-    mask.addEventListener('click', function (e) { if (e.target === mask) closeDlg(); });
+    mask.addEventListener('click', function (e) {
+      if (e.target !== mask) return;
+      // 遮罩刚弹出来的那一瞬间，触发它的那次点击（mouseup/click 余波）不能把弹窗关掉
+      if (Date.now() - _dlgShownAt < 260) return;
+      closeDlg();
+    });
     document.body.appendChild(mask);
   }
-  function openAccountList() {
+  // 弹窗统一从这里打开：记下时间，供遮罩的「点空白关闭」判断余波
+  function showMask() {
     ensureMask();
     mask.style.display = 'flex';
+    _dlgShownAt = Date.now();
+  }
+  function openAccountList() {
+    showMask();
     renderAccountList();
   }
   function openQrStage() {
-    ensureMask();
-    mask.style.display = 'flex';
+    showMask();
     renderQrStage();
   }
   function closeDlg() {
@@ -605,8 +615,9 @@
     '.txpd-notice-card{max-width:520px;width:100%;}',
     '.txpd-notice-card h3{margin:0 0 8px;font-size:15px;font-weight:600;color:var(--text-primary,#222);}',
     // 未加入频道的顶栏「加入」按钮（贴在频道名旁边）
-    '.txpd-join-slot{display:inline-flex;align-items:center;margin-left:10px;flex:none;vertical-align:middle;}',
-    '.txpd-join-btn{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 12px;border:none;border-radius:100px;background:var(--feedback-brand,#2b64f5);color:#fff;font-size:12px;font-family:inherit;cursor:pointer;flex:none;}',
+    // 标题行里可能压着应用的悬浮层：抬一下层级并显式接收指针事件，避免点不到
+    '.txpd-join-slot{display:inline-flex;align-items:center;margin-left:10px;flex:none;vertical-align:middle;position:relative;z-index:6;pointer-events:auto;}',
+    '.txpd-join-btn{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 12px;border:none;border-radius:100px;background:var(--feedback-brand,#2b64f5);color:#fff;font-size:12px;font-family:inherit;cursor:pointer;flex:none;position:relative;z-index:1;pointer-events:auto;}',
     '.txpd-join-btn:hover{opacity:.92;}',
     '.txpd-join-btn:disabled{opacity:.6;cursor:default;}',
     '.txpd-join-btn svg{width:14px;height:14px;}',
@@ -1197,14 +1208,49 @@
     }
     return raw;
   }
-  // 需要答题的加入方式（题目在 setting.question.items 里）
+  // 加入方式 → 该用哪种验证载荷。以 CLI 自己的说明为准（manage join-guild --help）：
+  //   DIRECT                              直接加入，无额外参数
+  //   ADMIN_AUDIT / QUESTION_WITH_ADMIN_AUDIT   join_guild_comment（附言/问题回答）
+  //   MULTI_QUESTION / QUIZ                join_guild_answers（每题一个答案；测试题填选项字母 A/B/C）
+  //   DISABLE                             禁止加入
   function joinNeedsAnswers(t) {
     var compact = String(t || '').replace(/_/g, '').toUpperCase();
-    return compact.indexOf('QUESTION') !== -1 || compact.indexOf('MULTI') !== -1 || compact.indexOf('QUIZ') !== -1;
+    return compact.indexOf('MULTI') !== -1 || compact.indexOf('QUIZ') !== -1;
   }
   function joinNeedsComment(t) {
     var compact = String(t || '').replace(/_/g, '').toUpperCase();
     return compact.indexOf('AUDIT') !== -1 || compact.indexOf('QUESTION') !== -1;
+  }
+  // 上游回复里直接带题目（CLI: need_verification 时返回 questions / quiz）
+  function verifyHintsFromReply(d) {
+    if (!d || typeof d !== 'object') return null;
+    var quiz = Array.isArray(d.quiz) ? d.quiz : [];
+    var qs = Array.isArray(d.questions) ? d.questions : [];
+    if (quiz.length) {
+      return {
+        mode: 'answers',
+        questions: quiz.map(function (q) {
+          var opts = Array.isArray(q.answers) ? q.answers : [];
+          return {
+            title: String((q && q.question) || q || ''),
+            options: opts.map(function (o, i) { return String.fromCharCode(65 + i) + '. ' + o; }),
+          };
+        }),
+      };
+    }
+    if (qs.length) {
+      return {
+        mode: 'comment',   // 问答类走附言：把每个问题的回答拼成一段
+        questions: qs.map(function (q) { return { title: String((q && q.question) || q || ''), options: [] }; }),
+      };
+    }
+    if (d.join_type) {
+      return {
+        mode: joinNeedsAnswers(d.join_type) ? 'answers' : (joinNeedsComment(d.join_type) ? 'comment' : ''),
+        questions: [],
+      };
+    }
+    return null;
   }
   // 从加入方式里取题目（结构各家略有差异，尽量兼容）
   function joinQuestionItems(setting) {
@@ -1227,14 +1273,24 @@
   function joinNeedsVerify(r) {
     var d = (r && r.data && r.data.data) || {};
     if (d && (d.need_verification || d.needVerification || d.pending)) return true;
+    if (d && (d.action === 'need_verification' || d.action === 'NEED_VERIFICATION')) return true;
     var msg = String((r && r.message) || '') + ' ' + String(d.hint || '');
-    return /答题|附言|验证|需要回答/.test(msg);
+    return /答题|附言|验证|需要回答|join_guild_answers|join_guild_comment/.test(msg);
+  }
+  // 上游报错里自带「该用哪种验证」：答题类只能给 answers，审核类才给 comment。
+  // 两者一起给会被 CLI 拒掉（实测：「需要提供 join_guild_answers，而非 join_guild_comment」）。
+  function verifyModeFromMessage(msg) {
+    var s = String(msg || '');
+    if (/join_guild_answers|答案列表/.test(s)) return 'answers';
+    if (/join_guild_comment/.test(s)) return 'comment';
+    if (/答题|答案/.test(s)) return 'answers';
+    if (/附言/.test(s)) return 'comment';
+    return '';
   }
 
   function openJoinFlow(guildNumber) {
-    ensureMask();
     stopPoll();
-    mask.style.display = 'flex';
+    showMask();
     dlg.innerHTML = '';
     dlg.appendChild(el('button', { id: 'txpd-acct-close' }, '×')).addEventListener('click', closeDlg);
     dlg.appendChild(el('h3', null, '加入频道'));
@@ -1277,31 +1333,85 @@
         // 输入区：题目（只读）+ 每题一个答案 + 附言（可选）
         var form = el('div');
         var answerInputs = [];
+        // 验证方式只能二选一：答题类给 join_guild_answers，审核类给 join_guild_comment。
+        // 两者一起给会被 CLI 直接拒（「需要提供 join_guild_answers，而非 join_guild_comment」）。
+        var verifyMode = joinNeedsAnswers(joinType) ? 'answers' : (joinNeedsComment(joinType) ? 'comment' : '');
+        // 上游回复里带的题目（CLI 在 need_verification 时会给出 questions / quiz），
+        // 比加入方式里那份更准，拿到就优先用
+        var replyQuestions = [];
+        function currentQuestions() { return replyQuestions.length ? replyQuestions : questions; }
+        // 问答类（走附言）：每题一个输入，提交时拼成一段附言
+        var commentParts = [];
+        function buildCommentAnswers() {
+          var qs = currentQuestions();
+          commentParts = [];
+          if (!qs.length) {
+            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '管理员审核：附言（可不填）：'));
+            form.appendChild(commentInput);
+            return;
+          }
+          qs.forEach(function (q, idx) {
+            if (q.title) {
+              form.appendChild(el('div', { style: 'font-size:13px;color:#333;font-weight:600;margin:10px 0 4px;' }, (qs.length > 1 ? (idx + 1) + '. ' : '') + q.title));
+            }
+            var inp = textInput('填写回答', '');
+            commentParts.push({ title: q.title || '', input: inp });
+            form.appendChild(inp);
+          });
+        }
         function buildForm() {
           form.innerHTML = '';
           form.style.cssText = 'margin-top:10px;';
-          if (questions.length) {
-            questions.forEach(function (q, idx) {
-              var qbox = el('div', { style: 'margin:10px 0 4px;' });
-              qbox.appendChild(el('div', { style: 'font-size:13px;color:#333;font-weight:600;' }, (questions.length > 1 ? (idx + 1) + '. ' : '') + (q.title || '请回答')));
-              if (q.options.length) {
-                qbox.appendChild(el('div', { style: 'font-size:12px;color:#888;margin-top:2px;' }, '可选：' + q.options.join(' / ')));
-              }
-              form.appendChild(qbox);
-              var inp = textInput(q.options.length ? '填写选项内容' : '填写答案', '');
-              answerInputs.push(inp);
-              form.appendChild(inp);
-            });
-          } else if (joinNeedsAnswers(joinType)) {
-            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '该频道需要答题验证，请填写答案（多题用换行分隔）：'));
-            var ta0 = areaInput('第一题的答案，第二题换行继续…', '', 68);
-            answerInputs.push(ta0);
-            form.appendChild(ta0);
+          answerInputs = [];
+          commentParts = [];
+          var qs = currentQuestions();
+          if (verifyMode === 'answers') {
+            if (qs.length) {
+              qs.forEach(function (q, idx) {
+                var qbox = el('div', { style: 'margin:10px 0 4px;' });
+                qbox.appendChild(el('div', { style: 'font-size:13px;color:#333;font-weight:600;' }, (qs.length > 1 ? (idx + 1) + '. ' : '') + (q.title || '请回答')));
+                form.appendChild(qbox);
+                var inp = textInput(q.options.length ? '填写选项字母（如 A）或内容' : '填写答案', '');
+                answerInputs.push(inp);
+                form.appendChild(inp);
+                // 有选项的（测试题）：点一下就把选项字母填进答案框，省得手打
+                if (q.options.length) {
+                  var opts = el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px;' });
+                  q.options.forEach(function (opt) {
+                    var chip = el('span', {
+                      style: 'font-size:12px;color:#2b64f5;border:1px solid rgba(43,100,245,.35);border-radius:100px;padding:2px 10px;cursor:pointer;',
+                    }, String(opt).slice(0, 40));
+                    chip.addEventListener('click', function (e3) {
+                      e3.stopPropagation();
+                      var letter = String(opt).charAt(0);
+                      inp.value = /^[A-H]$/.test(letter) ? letter : String(opt);
+                    });
+                    opts.appendChild(chip);
+                  });
+                  form.appendChild(opts);
+                }
+              });
+            } else {
+              form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '该频道需要答题验证，请填写答案（多题用换行分隔）：'));
+              var ta0 = areaInput('第一题的答案，第二题换行继续…', '', 68);
+              answerInputs.push(ta0);
+              form.appendChild(ta0);
+            }
+          } else if (verifyMode === 'comment') {
+            if (currentQuestions().length) {
+              form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:6px 0 2px;' }, '回答下面的问题（会作为附言一起提交）：'));
+            }
+            buildCommentAnswers();
           }
-          if (joinNeedsComment(joinType)) {
-            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '附言（可不填）：'));
-            form.appendChild(commentInput);
-          }
+          // 自动判断错了怎么办：给个手动切换的口子
+          var swap = el('div', { style: 'font-size:12px;color:#2b64f5;margin-top:6px;cursor:pointer;' },
+            verifyMode === 'answers' ? '该频道其实是要附言？点此改用附言' : '该频道其实是要答题？点此改用答题');
+          swap.addEventListener('click', function (e2) {
+            e2.stopPropagation();
+            verifyMode = (verifyMode === 'answers') ? 'comment' : 'answers';
+            buildForm();
+          });
+          form.appendChild(swap);
         }
         var commentInput = areaInput('想对管理员说的话…', '', 54);
         buildForm();
@@ -1349,38 +1459,64 @@
             return false;
           }).catch(function () { return true; });   // 列表拉不到时不误报「没加入」
         }
-        function ensureVerifyInputs() {
-          if (!answerInputs.length && !questions.length) {
-            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '该频道需要答题验证，请填写答案（多题用换行分隔）：'));
-            answerInputs.push(areaInput('填写答案…', '', 68));
-            form.appendChild(answerInputs[answerInputs.length - 1]);
+        function ensureVerifyInputs(r, msg) {
+          var hints = verifyHintsFromReply((r && r.data && r.data.data) || null);
+          if (hints) {
+            if (hints.mode) verifyMode = hints.mode;
+            if (hints.questions.length) replyQuestions = hints.questions;
           }
-          if (!commentInput.parentNode) {
-            form.appendChild(el('div', { style: 'font-size:13px;color:#666;margin:8px 0 4px;' }, '附言（可不填）：'));
-            form.appendChild(commentInput);
+          if (!verifyMode) verifyMode = verifyModeFromMessage(msg) || 'answers';
+          buildForm();
+        }
+        // 附言内容：逐题回答优先（拼成 "问题：回答" 多行），否则用附言框
+        function commentPayload() {
+          var typed = String(commentInput.value || '').trim();
+          var parts = [];
+          commentParts.forEach(function (item, i) {
+            var v = String(item.input.value || '').trim();
+            if (!v) return;
+            parts.push(item.title ? ((i + 1) + '. ' + item.title + '：' + v) : v);
+          });
+          if (parts.length) {
+            if (typed) parts.push(typed);
+            return parts.join(String.fromCharCode(10));
           }
+          return typed;
         }
         function submit() {
           var answers = collectedAnswers();
-          var comment = String(commentInput.value || '').trim();
+          var comment = commentPayload();
+          // 知道题目时答案不能为空；还不知道题目（比如测试题）就别拦——
+          // 空提交会让上游按 CLI 的约定把题目/选项返回给我们
+          if (verifyMode === 'answers' && !answers.length && currentQuestions().length) {
+            status.textContent = '请先填写答案';
+            status.style.color = '#e5484d';
+            return;
+          }
           joinBtn.disabled = true;
           joinBtn.textContent = '正在加入…';
           var req;
-          if (!answers.length && !comment) {
-            // 没有要填的：直接加入
-            req = api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } });
+          if (verifyMode === 'answers') {
+            // 还没填答案就别带空数组：CLI 对「未提供 answers」会返回验证提示（含题目/选项），
+            // 我们据此把题目与选项渲染出来
+            req = answers.length
+              ? api('/cli', { method: 'POST', body: { action: 'join-guild-verify', params: { guild_id: ch.guild_id }, stdin: { guild_id: ch.guild_id, join_guild_answers: answers.map(function (a) { return { answer: a }; }) } } })
+              : api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } });
+          } else if (verifyMode === 'comment') {
+            var stdinC = { guild_id: ch.guild_id };
+            if (comment) stdinC.join_guild_comment = comment;
+            req = comment
+              ? api('/cli', { method: 'POST', body: { action: 'join-guild-verify', params: { guild_id: ch.guild_id }, stdin: stdinC } })
+              : api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } });
           } else {
-            var stdin = { guild_id: ch.guild_id };
-            if (answers.length) stdin.join_guild_answers = answers.map(function (a) { return { answer: a }; });
-            if (comment) stdin.join_guild_comment = comment;
-            req = api('/cli', { method: 'POST', body: { action: 'join-guild-verify', params: { guild_id: ch.guild_id }, stdin: stdin } });
+            req = api('/cli', { method: 'POST', body: { action: 'join-guild', params: { guild_id: ch.guild_id } } });
           }
           req.then(function (r2) {
             if (!r2.success) {
-              // 还缺附言 / 答案：把输入区摆出来，并把上游原话贴出来
+              // 还缺附言 / 答案（上游会说明到底要哪一种）：摆出输入区并贴上游原话
               if (joinNeedsVerify(r2)) {
-                ensureVerifyInputs();
-                status.textContent = r2.message ? ('还需要验证：' + r2.message) : '还需要验证：请填写附言 / 答案后再试';
+                ensureVerifyInputs(r2, r2.message);
+                status.textContent = r2.message ? ('还需要验证：' + r2.message) : '还需要验证：请填写后再试';
                 status.style.color = '#e5484d';
                 joinBtn.disabled = false;
                 joinBtn.textContent = '提交验证';
@@ -1397,7 +1533,7 @@
             invalidateGuilds();
             return checkJoined(2).then(function (joined) {
               if (!joined) {
-                ensureVerifyInputs();
+                ensureVerifyInputs(r2, r2.message);
                 status.textContent = '上游返回成功，但账号还没出现在该频道的已加入列表：可能仍需答题 / 附言，或等待管理员审核'
                   + (r2.message ? '（上游：' + r2.message + '）' : '');
                 status.style.color = '#e5484d';
@@ -1421,11 +1557,12 @@
           });
         }
         joinBtn.addEventListener('click', submit);
-        // 需要答题的频道：直接按回车提交第一个输入框也算提交
-        answerInputs.forEach(function (inp) {
-          inp.addEventListener('keydown', function (e2) {
-            if (e2.key === 'Enter' && !e2.shiftKey && inp.tagName === 'INPUT') { e2.preventDefault(); submit(); }
-          });
+        // 答题框里按回车也算提交（委托在 form 上：切换验证方式重建输入框后依然有效）
+        form.addEventListener('keydown', function (e2) {
+          if (e2.key === 'Enter' && !e2.shiftKey && e2.target && e2.target.tagName === 'INPUT') {
+            e2.preventDefault();
+            submit();
+          }
         });
       });
     }).catch(function () {
@@ -1726,9 +1863,8 @@
 
   // ---------- 通用小面板（对话框内容切换用） ----------
   function openPanel(title, width) {
-    ensureMask();
     stopPoll();
-    mask.style.display = 'flex';
+    showMask();
     dlg.innerHTML = '';
     dlg.style.width = width || 'min(480px,92vw)';
     // 限高 + 内部滚动：表单再长也不会超出屏幕
@@ -2690,6 +2826,7 @@
 
   // 未加入该频道（插件账号没加入）→ 在频道名旁边放一个「加入」按钮，点击用 CLI 账号加入。
   // 注意：官方「加入频道」是网页账号的入口，两者互不影响；这里点的始终是插件账号。
+  var _joinClickAt = 0;
   function ensureJoinButton(joined) {
     var slot = document.querySelector('.txpd-join-slot');
     if (joined) {
@@ -2700,15 +2837,34 @@
     if (!titleRow) return;
     if (!slot) {
       slot = el('span', { 'class': 'txpd-join-slot' });
-      // 带文字的胶囊按钮（纯图标看不出是「加入」）；点击由 mount() 的 window 捕获层统一分派
+      // 带文字的胶囊按钮（纯图标看不出是「加入」）
       var btn = el('button', { 'class': 'txpd-join-btn', type: 'button', 'data-txpd-op': 'join', title: '用插件账号（CLI）加入该频道' });
       btn.appendChild(svgIcon('assets/common.svg#add', 14));
       btn.appendChild(el('span', null, '加入'));
+      // 直接挂在这颗按钮上，不再只依赖冒泡到 window 的总分派：
+      // 应用侧（标题行、悬浮卡）任何一层 stopPropagation 都会让总分派收不到点击，
+      // 表现就是「点好几次才弹一次」。
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+        if (Date.now() - _joinClickAt < 300) return;   // 连点只弹一次
+        _joinClickAt = Date.now();
+        var num = currentGuildNumber();
+        if (num) openJoinFlow(num);
+        else toast('未识别到频道号，无法发起加入');
+      });
       slot.appendChild(btn);
     }
     var nameEl = titleRow.querySelector('.guild-info__basic__name, .top_title_name');
-    if (nameEl) titleRow.insertBefore(slot, nameEl.nextSibling);   // 名字右边
-    else titleRow.appendChild(slot);
+    var anchor = nameEl ? nameEl.nextSibling : null;
+    // 已经在名字右边就什么都别做：insertBefore 把节点移到原位置同样会产生 DOM 变更，
+    // 而同步是每 3 秒 + 每次 DOM 变更都会跑的 —— 这会导致「自己触发自己」的循环，
+    // 按钮每轮都被摘掉重插，用户按下和抬起之间被换掉，click 就永远不派发了（表现为点好几次才弹）。
+    if (anchor === slot) return;
+    if (slot.parentNode !== titleRow || slot.nextSibling !== anchor) {
+      titleRow.insertBefore(slot, anchor);
+    }
   }
 
   // ---------- 未登录时页面提示（导航固定显示五项，缺登录态的页面显示「无法查看」） ----------
@@ -2957,9 +3113,10 @@
       expandPublishEditor(container);
       // 点的是表情图标：展开后顺手把表情面板弹出来，点一次就能用
       if (emojiIcon && container._txpdInsertEmoji) {
+        var mine0 = container.querySelector('[data-txpd-editor-added]');
         var icon = container.querySelector('[data-txpd-editor-added] .toolbar-button .icon-emoji') || emojiIcon;
         openEmojiPicker(icon.closest('.toolbar-button') || icon, function (item) {
-          container._txpdInsertEmoji(container.querySelector('[data-txpd-content]'), item);
+          container._txpdInsertEmoji((mine0 || container).querySelector('[data-txpd-content]'), item);
         });
       }
     }, true);
@@ -2975,7 +3132,7 @@
     var unknown = (_joinedKeys === null || _joinedKeys === undefined);
     var container = visiblePublishContainer();
     if (!container) return;
-    var hint = container.querySelector('.editor-header .user-name');
+    var hint = (container.querySelector('[data-txpd-editor-added]') || container).querySelector('.editor-header .user-name');
     if (hint && joined) hint.textContent = '发帖将以 CLI 当前账号身份发表，点击输入框开始';
     if (!joined && !unknown && container.getAttribute('data-txpd-expanded') === '1') {
       collapsePublishEditor(container);   // 明确没加入：收起，交还官方节点
@@ -3403,6 +3560,11 @@
       });
       box.removeAttribute('data-txpd-expanded');
     });
+    // 版块浮层挂在 body 上（fixed 定位避开 overflow:hidden），收起时要一并带走
+    var dd0 = document.getElementById('txpd-channel-dd');
+    if (dd0 && dd0.parentNode) dd0.parentNode.removeChild(dd0);
+    var pk0 = document.getElementById('txpd-emoji-picker');
+    if (pk0 && pk0.parentNode) pk0.parentNode.removeChild(pk0);
     _pubImages = [];
   }
 
@@ -3430,7 +3592,7 @@
     return html.replace(/\n/g, '<br>');
   }
 
-  var OFFICIAL_COMPOSER_HTML = "<div class=\"editor-area\" data-v-1c099b7e><div class=\"editor-header pointer\" data-v-1c099b7e><div class=\"user-info\" data-v-1c099b7e><img src=\"https://qqchannel-profile-1251316161.file.myqcloud.com/wxxcxdefault\" class=\"avatar\" alt=\"\" data-v-1c099b7e><span class=\"user-name\" data-v-1c099b7e>\u53d1\u5e16\u5c06\u4ee5 CLI \u5f53\u524d\u8d26\u53f7\u8eab\u4efd\u53d1\u8868\uff0c\u70b9\u51fb\u6b64\u5904\u8f93\u5165</span></div><div class=\"toolbar-area\" data-v-1c099b7e><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-emoji\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#emoji\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-at\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#at\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-image\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#image\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg width=\"20\" height=\"20\" class=\"icon-svg\" viewbox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\" data-v-1c099b7e><path d=\"M10.078 13.797C9.60006 13.4587 8.96861 13.0501 8.43374 12.8338C7.26763 12.3622 5.6115 12.4205 4.38399 12.5621C3.53188 12.6605 2.72986 12.0143 2.72986 11.1565C2.72986 9.83204 2.72986 8.72527 2.72986 7.38215C2.72986 6.57948 3.43379 5.95326 4.23474 6.00586C5.4523 6.08583 7.16672 6.12682 8.43374 5.86935C10.1696 5.51659 12.1915 4.37484 13.7037 3.38356C14.641 2.76907 15.9691 3.42615 15.9691 4.54697C15.9691 6.31738 15.9691 7.78715 15.9691 9.88398\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\" stroke-linecap=\"square\"></path><path d=\"M7.03646 12.4248L7.91263 15.3797C8.1828 16.2908 7.50008 17.2053 6.54973 17.2053V17.2053C5.92028 17.2053 5.36578 16.7914 5.18683 16.1879L4.071 12.4248\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\"></path><path d=\"M14.6181 11.8909C14.7569 11.5392 15.2546 11.5392 15.3934 11.8909L16.0345 13.5165C16.0769 13.6239 16.1619 13.7089 16.2693 13.7513L17.8949 14.3924C18.2467 14.5312 18.2467 15.0289 17.8949 15.1677L16.2693 15.8088C16.1619 15.8512 16.0769 15.9362 16.0345 16.0436L15.3934 17.6692C15.2546 18.0209 14.7569 18.0209 14.6181 17.6692L13.977 16.0436C13.9346 15.9362 13.8496 15.8512 13.7423 15.8088L12.1166 15.1677C11.7649 15.0289 11.7649 14.5312 12.1166 14.3924L13.7423 13.7513C13.8496 13.7089 13.9346 13.6239 13.977 13.5165L14.6181 11.8909Z\" fill=\"currentColor\" style=\"fill:currentColor;fill-opacity:1;\"></path></svg></span><!--]--><!----><!--]--><!----><!--[--><!--[--><!--]--><!----><!--]--><span data-v-1c099b7e></span></div></div><div class=\"editor-divider\" data-v-1c099b7e></div><div class=\"editor-root-container\" data-v-1c099b7e><div class=\"ProseMirror\" contenteditable=\"true\" data-txpd-content data-v-1c099b7e></div></div><div class=\"upload-area\" data-v-1c099b7e><div class=\"upload-left\" data-v-1c099b7e><!--[--><div class=\"image-video-container\" data-v-90ae7ef7><div class=\"preview-list\" data-v-90ae7ef7><!----><!----><div class=\"upload-button\" style=\"top:0;left:0;\" data-v-90ae7ef7><svg class=\"icon-svg-symbol icon-add-upload\" style=\"color:currentColor;width:36px;height:36px;\" data-v-90ae7ef7><use xlink:href=\"assets/common.svg#add-upload\"></use></svg></div></div></div><!----><!--]--><!----></div><div class=\"bottom-bar\" data-v-1c099b7e><div class=\"word-count\" data-v-1c099b7e>0/1000</div><div class=\"chose-channel\" data-v-1c099b7e><button class=\"g-button g-button--default g-button--small chose-channel-btn\" style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--><!----> \u4e0d\u9009\u62e9\u7248\u5757 <svg class=\"icon-svg-symbol icon-arrow-right\" style=\"color:currentColor;width:10px;height:10px;margin-left:4px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#arrow-right\"></use></svg><!--]--></button></div><!----><div class=\"publish-button\" data-v-1c099b7e><button class=\"g-button g-button--primary g-button--small btn\" disabled style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--> \u53d1\u8868<!--]--></button></div></div></div></div>";
+  var OFFICIAL_COMPOSER_HTML = "<div class=\"editor-area\" data-v-1c099b7e><div class=\"editor-header pointer\" data-v-1c099b7e><div class=\"user-info\" data-v-1c099b7e><img src=\"https://qqchannel-profile-1251316161.file.myqcloud.com/wxxcxdefault\" class=\"avatar\" alt=\"\" data-v-1c099b7e><span class=\"user-name\" data-v-1c099b7e>\u53d1\u5e16\u5c06\u4ee5 CLI \u5f53\u524d\u8d26\u53f7\u8eab\u4efd\u53d1\u8868\uff0c\u70b9\u51fb\u6b64\u5904\u8f93\u5165</span></div><div class=\"toolbar-area\" data-v-1c099b7e><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-emoji\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#emoji\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-image\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#image\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg width=\"20\" height=\"20\" class=\"icon-svg\" viewbox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\" data-v-1c099b7e><path d=\"M10.078 13.797C9.60006 13.4587 8.96861 13.0501 8.43374 12.8338C7.26763 12.3622 5.6115 12.4205 4.38399 12.5621C3.53188 12.6605 2.72986 12.0143 2.72986 11.1565C2.72986 9.83204 2.72986 8.72527 2.72986 7.38215C2.72986 6.57948 3.43379 5.95326 4.23474 6.00586C5.4523 6.08583 7.16672 6.12682 8.43374 5.86935C10.1696 5.51659 12.1915 4.37484 13.7037 3.38356C14.641 2.76907 15.9691 3.42615 15.9691 4.54697C15.9691 6.31738 15.9691 7.78715 15.9691 9.88398\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\" stroke-linecap=\"square\"></path><path d=\"M7.03646 12.4248L7.91263 15.3797C8.1828 16.2908 7.50008 17.2053 6.54973 17.2053V17.2053C5.92028 17.2053 5.36578 16.7914 5.18683 16.1879L4.071 12.4248\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\"></path><path d=\"M14.6181 11.8909C14.7569 11.5392 15.2546 11.5392 15.3934 11.8909L16.0345 13.5165C16.0769 13.6239 16.1619 13.7089 16.2693 13.7513L17.8949 14.3924C18.2467 14.5312 18.2467 15.0289 17.8949 15.1677L16.2693 15.8088C16.1619 15.8512 16.0769 15.9362 16.0345 16.0436L15.3934 17.6692C15.2546 18.0209 14.7569 18.0209 14.6181 17.6692L13.977 16.0436C13.9346 15.9362 13.8496 15.8512 13.7423 15.8088L12.1166 15.1677C11.7649 15.0289 11.7649 14.5312 12.1166 14.3924L13.7423 13.7513C13.8496 13.7089 13.9346 13.6239 13.977 13.5165L14.6181 11.8909Z\" fill=\"currentColor\" style=\"fill:currentColor;fill-opacity:1;\"></path></svg></span><!--]--><!----><!--]--><!----><!--[--><!--[--><!--]--><!----><!--]--><span data-v-1c099b7e></span></div></div><div class=\"editor-divider\" data-v-1c099b7e></div><div class=\"editor-root-container\" data-v-1c099b7e><div class=\"ProseMirror\" contenteditable=\"true\" data-txpd-content data-v-1c099b7e></div></div><div class=\"upload-area\" data-v-1c099b7e><div class=\"upload-left\" data-v-1c099b7e><!--[--><div class=\"image-video-container\" data-v-90ae7ef7><div class=\"preview-list\" data-v-90ae7ef7><!----><!----><div class=\"upload-button\" style=\"top:0;left:0;\" data-v-90ae7ef7><svg class=\"icon-svg-symbol icon-add-upload\" style=\"color:currentColor;width:36px;height:36px;\" data-v-90ae7ef7><use xlink:href=\"assets/common.svg#add-upload\"></use></svg></div></div></div><!----><!--]--><!----></div><div class=\"bottom-bar\" data-v-1c099b7e><div class=\"word-count\" data-v-1c099b7e>0/1000</div><div class=\"chose-channel\" data-v-1c099b7e><button class=\"g-button g-button--default g-button--small chose-channel-btn\" style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--><!----> \u4e0d\u9009\u62e9\u7248\u5757 <svg class=\"icon-svg-symbol icon-arrow-right\" style=\"color:currentColor;width:10px;height:10px;margin-left:4px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#arrow-right\"></use></svg><!--]--></button></div><!----><div class=\"publish-button\" data-v-1c099b7e><button class=\"g-button g-button--primary g-button--small btn\" disabled style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--> \u53d1\u8868<!--]--></button></div></div></div></div>";
 
 
   function expandPublishEditor(container) {
@@ -3460,24 +3622,28 @@
       container.appendChild(ch);
     }
     var ctx = currentGuild();
+    // 关键：容器里**同时存在两份**同结构节点 —— 被隐藏的官方那份 + 我们追加的那份。
+    // container.querySelector 取到的是文档里更靠前的官方节点，于是监听器全挂到了隐藏节点上，
+    // 用户点自己看得见的图标（比如上传图片）自然「没反应」。所以一律在我们自己的子树里找。
+    var mine = container.querySelector('[data-txpd-editor-added]') || container;
     // 展开后自动聚焦输入区
     setTimeout(function () {
-      var ce0 = container.querySelector('[data-txpd-content]');
+      var ce0 = mine.querySelector('[data-txpd-content]');
       if (ce0) ce0.focus();
     }, 80);
-    var contentEl = container.querySelector('[data-txpd-content]');
-    var wordCount = container.querySelector('.word-count');
-    var choseBtn = container.querySelector('.chose-channel-btn');
-    var pubBtn = container.querySelector('.publish-button button');
-    var uploadBtn = container.querySelector('.upload-button');
-    var previewList = container.querySelector('.preview-list');
-    var userName = container.querySelector('.user-name');
+    var contentEl = mine.querySelector('[data-txpd-content]');
+    var wordCount = mine.querySelector('.word-count');
+    var choseBtn = mine.querySelector('.chose-channel-btn');
+    var pubBtn = mine.querySelector('.publish-button button');
+    var uploadBtn = mine.querySelector('.upload-button');
+    var previewList = mine.querySelector('.preview-list');
+    var userName = mine.querySelector('.user-name');
     if (userName) userName.textContent = '发帖将以 CLI 当前账号身份发表，点击下方输入';
     // 状态/报错行。以前这里没有对应节点，status 落到了 window.status（一个字符串）上，
     // 于是「正在发表…」「上游原始报错」全都看不见 —— 用户只能看到什么都没发生。
     var status = el('div', { 'class': 'txpd-pub-status' });
     status.style.cssText = 'font-size:13px;color:#888;padding:0 12px 8px;min-height:18px;word-break:break-all;';
-    var areaEl0 = container.querySelector('.editor-area');
+    var areaEl0 = mine.querySelector('.editor-area') || mine;
     if (areaEl0) areaEl0.appendChild(status); else container.appendChild(status);
     function setStatus(text, color) {
       status.textContent = text || '';
@@ -3562,7 +3728,8 @@
         e.stopImmediatePropagation();
         e.stopPropagation();
         var anchor = ic.closest('.toolbar-button') || ic;
-        var host = ic.closest('.publish-editor-container') || container;
+        // 在「我们那份」子树里找输入区（容器里还有一份隐藏的官方节点，不能抓错）
+        var host = ic.closest('[data-txpd-editor-added]') || mine;
         var ce = host.querySelector('[data-txpd-content]') || contentEl;
         openEmojiPicker(anchor, function (item) { insertPubEmoji(ce, item); });
       }, true);
@@ -3590,13 +3757,36 @@
       }).catch(function () { channelsLoaded = true; return channels; });
     }
     loadChannels();
+    // 版块浮层用 fixed 定位贴在按钮上方。以前是塞进 .chose-channel 里（position:absolute），
+    // 而那个容器是 overflow:hidden —— 浮层整块被裁掉，看起来就是「点版块没反应」。
+    function closeChannelDD() {
+      var exist = document.getElementById('txpd-channel-dd');
+      if (exist && exist.parentNode) exist.parentNode.removeChild(exist);
+      document.removeEventListener('click', onDocClickForDD, true);
+      window.removeEventListener('scroll', closeChannelDD, true);
+    }
+    function onDocClickForDD(ev) {
+      var dd0 = document.getElementById('txpd-channel-dd');
+      if (!dd0) return;
+      if (dd0.contains(ev.target)) return;
+      if (choseBtn && choseBtn.contains(ev.target)) return;
+      closeChannelDD();
+    }
     if (choseBtn) {
       choseBtn.addEventListener('click', function (e) {
         e.stopPropagation();
-        var exist = container.querySelector('.txpd-channel-dropdown');
-        if (exist) { exist.parentNode.removeChild(exist); return; }
-        var dd = el('div', { 'class': 'txpd-channel-dropdown' });
-        dd.style.cssText = 'position:absolute;bottom:52px;right:12px;background:#fff;border:1px solid #e5e5e5;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.14);z-index:20;min-width:170px;max-height:230px;overflow:auto;';
+        if (document.getElementById('txpd-channel-dd')) { closeChannelDD(); return; }
+        var dd = el('div', { 'class': 'txpd-channel-dropdown', id: 'txpd-channel-dd' });
+        var r0 = choseBtn.getBoundingClientRect();
+        // 上方放得下就往上弹，放不下（按钮贴着顶）就往下弹，别把浮层顶出屏幕
+        var openUp = r0.top > 250;
+        dd.style.cssText = 'position:fixed;z-index:2147483005;'
+          + 'left:' + Math.max(8, Math.min(r0.left, window.innerWidth - 260)) + 'px;'
+          + (openUp
+            ? ('top:' + Math.max(8, r0.top - 6) + 'px;transform:translateY(-100%);')
+            : ('top:' + Math.min(window.innerHeight - 60, r0.bottom + 6) + 'px;'))
+          + 'background:#fff;border:1px solid #e5e5e5;border-radius:8px;'
+          + 'box-shadow:0 4px 16px rgba(0,0,0,.14);min-width:180px;max-width:320px;max-height:240px;overflow:auto;';
         function paint() {
           dd.innerHTML = '';
           if (!channelsLoaded) { dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '版块加载中…')); return; }
@@ -3621,15 +3811,18 @@
                 var n = choseBtn.childNodes[i];
                 if (n.nodeType === 3 && n.textContent.trim()) { n.textContent = ' ' + (ch.channel_name || ''); break; }
               }
-              dd.parentNode.removeChild(dd);
+              closeChannelDD();
             });
             dd.appendChild(row);
           });
         }
         paint();
         if (!channelsLoaded) loadChannels().then(paint);
-        choseBtn.parentNode.style.position = 'relative';
-        choseBtn.parentNode.appendChild(dd);
+        document.body.appendChild(dd);
+        setTimeout(function () {
+          document.addEventListener('click', onDocClickForDD, true);
+          window.addEventListener('scroll', closeChannelDD, true);
+        }, 0);
       });
     }
     // 发表：图片上传 → /publish
@@ -3722,9 +3915,8 @@
   }
 
   function openCommentFlow(mode, commentId) {
-    ensureMask();
     stopPoll();
-    mask.style.display = 'flex';
+    showMask();
     dlg.innerHTML = '';
     dlg.appendChild(el('button', { id: 'txpd-acct-close' }, '×')).addEventListener('click', closeDlg);
     dlg.appendChild(el('h3', null, mode === 'reply' ? '回复评论' : '发表评论'));
@@ -4055,7 +4247,6 @@
           + '<span class="user-name" data-v-1c099b7e="">发帖将以 CLI 当前账号身份发表，点击输入框开始</span></div>'
           + '<div class="toolbar-area" data-v-1c099b7e="">'
           + tb('icon-emoji', 'assets/common.svg#emoji')
-          + tb('icon-at', 'assets/common.svg#at')
           + tb('icon-image', 'assets/common.svg#image')
           + TXPD_TB_FOURTH
           + '</div></div>'
