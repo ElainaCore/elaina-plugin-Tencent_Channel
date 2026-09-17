@@ -256,7 +256,6 @@ def _render_result(
                     lines.append(_quick_cmd(resume, "继续执行"))
         summary_lines = _render_summary(title, data, guild_id=guild_id) or []
         # 如果 _render_summary 没有针对该 title 的专门处理（只返回了空或极少内容），
-        # 用通用兜底渲染展示关键字段，避免用户看到原始 JSON
         has_real_content = any(
             l
             for l in summary_lines

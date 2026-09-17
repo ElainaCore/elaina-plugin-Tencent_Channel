@@ -1,23 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""Web 管理面板：pd.qq.com 官网同款界面（本地镜像）+ 完整管理 API。
-
-页面：
-- web/panel/index.html —— pd.qq.com/explore 官方页面原样镜像，
-  以完整 HTML 文档挂在 /api/web-pages/tencent-channel-panel（宿主 iframe 加载）。
-- web/panel/manage.html —— 旧版管理界面（历史遗留，可自行挂载）。
-
-管理 API（/api/ext/tencent-channel/*，全部复用后台登录鉴权）：
-- POST /cli            65 个 CLI action 白名单
-- GET/POST /users      账号槽位列表 / 增删切换
-- POST /users/status   单槽位登录状态+昵称
-- GET /history         发帖历史
-- GET/POST /admins     插件管理员
-- GET/POST /notify-settings  通知设置
-- GET /schedules + save/toggle/run/delete  定时发帖
-- POST /publish        立即发帖
-- GET /panel/<file>    pd.qq.com 镜像静态资源
-"""
+"""Web 管理面板：pd.qq.com 官网同款界面（本地镜像）+ 完整管理 API。"""
 
 import asyncio
 import base64
@@ -30,7 +12,7 @@ import copy
 import json
 import time as _time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from aiohttp import web
@@ -123,7 +105,16 @@ def _proxy_cookie(user: str) -> str:
 
 # ==================== 访客受限频道：官方前端 + 插件账号数据 ====================
 
-_FEED_TPL_PATH = Path(__file__).resolve().parent / "_feed_tpl.json"
+def _feed_tpl_path() -> Path:
+    """合成 feeds 用的「官方真实响应模板」位置。"""
+    here = Path(__file__).resolve().parent
+    for cand in (here / "panel" / "_feed_tpl.json", here / "_feed_tpl.json"):
+        if cand.is_file():
+            return cand
+    return here / "panel" / "_feed_tpl.json"
+
+
+_FEED_TPL_PATH = _feed_tpl_path()
 _feed_tpl_cache: Dict[str, Any] = {}
 _joined_keys_cache: Dict[str, Any] = {"ts": 0.0, "numbers": set(), "ids": {}}
 # 合成结果缓存（避免官方前端反复拉取时把 CLI 打爆）：number -> (ts, bytes)
@@ -172,6 +163,74 @@ def _is_gated(gnum: str) -> bool:
 
 # 6 位访客权限位（bit5 公开内容 / bit4 帖子互动 / bit3 发帖 / bit2 直播 / bit1 语音 / bit0 聊天）
 PERMIT_ALL_VISITOR = 63
+
+
+# 频道号 ⬌ 频道 ID 映射（官方客户端在「频道号是纯数字」时直接发 guild_id，
+_num_to_gid: Dict[str, str] = {}
+_gid_to_num: Dict[str, str] = {}
+
+
+def _remember_ids(gnum: str, gid: str) -> None:
+    gnum, gid = str(gnum or ""), str(gid or "")
+    if gnum and gid:
+        _num_to_gid[gnum] = gid
+        _gid_to_num[gid] = gnum
+
+
+async def _cli_lookup_guild_id(gnum: str, user: str) -> str:
+    """未加入的频道：用 CLI 搜频道号换 guild_id（合成 feeds 需要 guild-id 参数）"""
+    try:
+        async with _cli_lock:
+            res = await _run_cli_json(["manage", "search-guild-content", "--keyword", gnum, "--json"], user)
+        chans = ((res or {}).get("data") or {}).get("data", {}).get("channels") or []
+        for c in chans:
+            if str(c.get("guild_number") or "") == gnum and c.get("guild_id"):
+                _remember_ids(gnum, str(c["guild_id"]))
+                return str(c["guild_id"])
+    except Exception:
+        pass
+    return ""
+
+
+async def _resolve_guild_ids(req: Dict[str, Any], user: str, page_gnum: str = "") -> Tuple[str, str]:
+    """从官方客户端的请求体里解析 (guild_id, guild_number)，必要时用 CLI 补齐。"""
+    gid = str(req.get("guild_id") or "")
+    gnum = str(req.get("guild_number") or "")
+    sign = req.get("channelSign")
+    if isinstance(sign, dict):
+        gid = gid or str(sign.get("guild_id") or "")
+        gnum = gnum or str(sign.get("guild_number") or "")
+    if not gid:
+        # 匿名态（没网页登录）时官方前端用 ?channelList&polling，id 在 polling_guild_id /
+        poll_ids = req.get("polling_guild_id")
+        if isinstance(poll_ids, list) and poll_ids:
+            gid = str(poll_ids[0] or "")
+    if not gid:
+        for key in ("cmd0xf57_req", "cmd0xf59_req", "cmd0xf55_req", "cmd0xf5d_req"):
+            node = req.get(key)
+            if not isinstance(node, dict):
+                continue
+            for lst_key in ("rpt_req_guild_info_list", "rpt_uint64_guild_id"):
+                lst = node.get(lst_key)
+                if isinstance(lst, list) and lst:
+                    first = lst[0]
+                    gid = str((first.get("uint64_guild_id") if isinstance(first, dict) else first) or "")
+                    break
+            if gid:
+                break
+    if not gnum and not gid and page_gnum:
+        # 请求体里没有 id（官方前端有些调用只带 bkn）→ 用页面地址里的频道号兜底
+        gnum = str(page_gnum)
+    if gid and not gnum:
+        gnum = _gid_to_num.get(gid, "")
+    if gnum and not gid:
+        gid = _num_to_gid.get(gnum, "")
+        if not gid:
+            keys = await _joined_keys(user)
+            gid = str(keys["ids"].get(gnum) or "") or await _cli_lookup_guild_id(gnum, user)
+    if gnum and gid:
+        _remember_ids(gnum, gid)
+    return gid, gnum
 
 
 def _b64_text(v: Any) -> str:
@@ -326,32 +385,124 @@ def _build_feeds_payload(feeds: List[Dict[str, Any]], gnum: str, gid: str) -> by
 _load_joined_file()
 
 
-async def _try_official_frontend(url: str, body: bytes, content: bytes, user: str):
-    """受限频道：改写上游响应，让官方前端正常渲染（返回新的响应体或 None）"""
+async def _synth_guild_info(gid: str, gnum: str, user: str) -> Optional[bytes]:
+    """没有网页登录态时，用 CLI 数据把「频道信息」响应造出来，让官方前端照常渲染频道页。"""
+    key = "info|" + str(gid)
+    hit = _feeds_synth_cache.get(key)
+    if hit and (_time.time() - hit[0]) < _FEEDS_SYNTH_TTL:
+        return hit[1]
+    async with _cli_lock:
+        info = await _run_cli_json(["manage", "get-guild-info", "--guild-id", gid, "--json"], user)
+        chans = await _run_cli_json(["manage", "get-guild-channel-list", "--guild-id", gid, "--json"], user)
+    d = ((info or {}).get("data") or {}).get("data") or {}
+    name = str(d.get("name") or d.get("guild_name") or "")
+    num = str(d.get("guild_number") or gnum or "")
+    if not name and not num:
+        return None
     try:
-        if "HandleProcess" in url and b"cmd0xf57_rsp" in content:
-            keys = await _joined_keys(user)
-            if not keys["numbers"]:
+        members = int(str(d.get("member_count") or "0").strip() or 0)
+    except Exception:
+        members = 0
+    keys = await _joined_keys(user)
+    joined = bool((num and num in keys["numbers"]) or (str(gid) in set(keys["ids"].values())))
+    chan_list = []
+    for c in (((chans or {}).get("data") or {}).get("data", {}).get("channels") or []):
+        cid = str((c or {}).get("channel_id") or "")
+        if not cid:
+            continue
+        cname = str((c or {}).get("channel_name") or "")
+        chan_list.append({
+            "uint64_channel_id": cid,
+            "msg_text_channel_info": {
+                "bytes_channel_name": base64.b64encode(cname.encode()).decode(),
+                "uint32_show_private_channel": 1,
+            },
+        })
+    b64 = lambda v: base64.b64encode(str(v).encode()).decode()
+    doc = {
+        "retcode": 0, "error": {"code": 0, "message": ""}, "message": "",
+        "data": {
+            "cmd0xf57_rsp": {"rpt_rsp_guild_info_list": [{
+                "uint64_guild_id": str(gid),
+                "msg_guild_info": {
+                    "bytes_guild_number": b64(num), "str_guild_number": num,
+                    "bytes_guild_name": b64(name), "str_guild_name": name,
+                    "uint32_member_num": members,
+                    "uint32_is_visible_for_visitor": 1,
+                    # 放开访客权限位 → 官方按「完整频道主页」渲染（内容由合成 feeds 提供）
+                    "uint32_vistor_interaction_all_switch": PERMIT_ALL_VISITOR,
+                },
+                # 是不是成员按 CLI 的实际情况写，不假装
+                "msg_cmd_uin_info": {"uint32_is_member": 2 if joined else 0},
+            }]},
+            # 官方前端从 cmd0xf5d_rsp.rpt_msg_guild_info_list[0].rpt_msg_channel_list 取版块页签
+            "cmd0xf5d_rsp": {"rpt_msg_guild_info_list": [{
+                "uint64_guild_id": str(gid),
+                "msg_guild_info": {},
+                "rpt_msg_channel_list": chan_list,
+            }]},
+            "cmd0xf55_rsp": {"msg_channel_list": chan_list},
+        },
+    }
+    payload = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    _feeds_synth_cache[key] = (_time.time(), payload)
+    return payload
+
+
+async def _try_official_frontend(url: str, body: bytes, content: bytes, user: str, page_gnum: str = ""):
+    """受限频道：改写上游响应，让**官方前端自己渲染**（返回新的响应体或 None）。"""
+    try:
+        looks_like_guild_info = (
+            "guild_fetchGuildInfo" in url
+            or b"cmd0xf57_rsp" in content
+            or b"cmd0xf57_req" in body
+            or b"cmd0xf5d_req" in body
+            or b"polling_guild_id" in body
+        )
+        if "HandleProcess" in url and looks_like_guild_info:
+            # 没有网页登录态：上游只会回「uin not found」，官方前端于是白屏 / 缺顶栏。
+            if not _proxy_cookie(user):
+                _gid0 = _gnum0 = ""
+                try:
+                    _req0 = json.loads(body.decode("utf-8")) if body else {}
+                except Exception:
+                    _req0 = {}
+                if isinstance(_req0, dict):
+                    _gid0, _gnum0 = await _resolve_guild_ids(_req0, user, page_gnum)
+                if _gid0:
+                    _synth = await _synth_guild_info(_gid0, _gnum0, user)
+                    if _synth:
+                        return _synth
+                # 解析不出频道（或 CLI 也拿不到）→ 给「一条记录」的结构完整信封：
+                return _placeholder_guild_doc(_gid0, _gnum0)
+
+            if b"cmd0xf57_rsp" not in content:
                 return None
             doc = json.loads(content.decode("utf-8"))
+            keys = await _joined_keys(user)
             lst = (((doc.get("data") or {}).get("cmd0xf57_rsp") or {}).get("rpt_rsp_guild_info_list") or [])
             changed = False
             for item in lst:
                 gi = item.get("msg_guild_info") or {}
                 gnum = _b64_text(gi.get("bytes_guild_number"))
-                if gnum and gnum in keys["numbers"] and _is_gated(gnum):
-                    # 放开访客权限（官方据此渲染完整频道主页而不是提示卡）
-                    gi["uint32_vistor_interaction_all_switch"] = PERMIT_ALL_VISITOR
-                    gi["uint32_is_visible_for_visitor"] = 1
-                    # 插件账号确实是成员 → 让官方按「已加入」渲染
+                gid = str(item.get("uint64_guild_id") or "")
+                if gnum and gid:
+                    _remember_ids(gnum, gid)
+                # 上游明确拒绝过这个频道的内容（GetGuildFeeds 非 0）→ 放开访客权限位，
+                if not ((gnum and _is_gated(gnum)) or (gid and _is_gated(gid))):
+                    continue
+                gi["uint32_vistor_interaction_all_switch"] = PERMIT_ALL_VISITOR
+                gi["uint32_is_visible_for_visitor"] = 1
+                # 只有插件账号真的是成员才标「已加入」：否则官方会放出「发表」入口，
+                if gnum and gnum in keys["numbers"]:
                     ui = item.get("msg_cmd_uin_info") or {}
                     if ui:
                         ui["uint32_is_member"] = 2
-                    changed = True
+                changed = True
             if changed:
                 return json.dumps(doc, ensure_ascii=False).encode("utf-8")
             return None
-        if "GetGuildFeeds" in url:
+        if "GetGuildFeeds" in url or "GetChannelTimelineFeeds" in url:
             # 官方自己拿得到内容（公开频道）就不动它
             if b'"retcode":0' in content[:60]:
                 return None
@@ -359,17 +510,33 @@ async def _try_official_frontend(url: str, body: bytes, content: bytes, user: st
                 req = json.loads(body.decode("utf-8")) if body else {}
             except Exception:
                 req = {}
-            gnum = str(req.get("guild_number") or "")
-            keys = await _joined_keys(user)
-            if not gnum or gnum not in keys["numbers"]:
+            if not isinstance(req, dict):
+                req = {}
+            timeline = "GetChannelTimelineFeeds" in url
+            gid, gnum = await _resolve_guild_ids(req, user, page_gnum)
+            if not gid:
                 return None
-            _mark_gated(gnum)   # 上游拒绝 → 记为受限频道（随后频道信息里的权限位才会被放开）
-            hit = _feeds_synth_cache.get(gnum)
+            channel_id = ""
+            if timeline:
+                sign = req.get("channelSign")
+                channel_id = str((sign or {}).get("channel_id") or "") if isinstance(sign, dict) else ""
+            cache_key = (gnum or gid) + ("|" + channel_id if channel_id else "") + ("|tl" if timeline else "")
+            hit = _feeds_synth_cache.get(cache_key)
             if hit and (_time.time() - hit[0]) < _FEEDS_SYNTH_TTL:
                 return hit[1]
-            gid = keys["ids"].get(gnum, "")
+            # 上游拒绝 → 记为受限频道（频道信息里才会放开权限位）
+            if gnum:
+                _mark_gated(gnum)
+            if gid:
+                _mark_gated(gid)
+            args = (
+                ["feed", "get-channel-timeline-feeds", "--guild-id", gid, "--channel-id", channel_id,
+                 "--count", "20", "--json"]
+                if (timeline and channel_id)
+                else ["feed", "get-guild-feeds", "--guild-id", gid, "--count", "20", "--json"]
+            )
             async with _cli_lock:
-                res = await _run_cli_json(["feed", "get-guild-feeds", "--guild-id", gid, "--count", "20", "--json"], user)
+                res = await _run_cli_json(args, user)
             data = ((res or {}).get("data") or {}).get("data") or {}
             feeds = data.get("feeds") or []
             if not feeds:
@@ -378,11 +545,61 @@ async def _try_official_frontend(url: str, body: bytes, content: bytes, user: st
                     return hit[1]
                 return None
             payload = _build_feeds_payload(feeds, gnum, gid)
-            _feeds_synth_cache[gnum] = (_time.time(), payload)
+            _feeds_synth_cache[cache_key] = (_time.time(), payload)
             return payload
     except Exception:
         return None
     return None
+
+
+def _placeholder_guild_doc(gid: str = "", gnum: str = "", name: str = "", members: int = 0,
+                          joined: bool = False, channels: Optional[List[Dict[str, Any]]] = None) -> bytes:
+    """结构完整的频道信息信封（至少一条记录）。"""
+    b64 = lambda v: base64.b64encode(str(v).encode()).decode()
+    chan_list: List[Dict[str, Any]] = []
+    for c in (channels or []):
+        cid = str((c or {}).get("channel_id") or "")
+        if not cid:
+            continue
+        chan_list.append({
+            "uint64_channel_id": cid,
+            "msg_text_channel_info": {
+                "bytes_channel_name": b64((c or {}).get("channel_name") or ""),
+                "uint32_show_private_channel": 1,
+            },
+        })
+    gi = {
+        "bytes_guild_number": b64(gnum), "str_guild_number": gnum,
+        "bytes_guild_name": b64(name), "str_guild_name": name,
+        "uint32_member_num": members,
+        "uint32_is_visible_for_visitor": 1,
+        "uint32_vistor_interaction_all_switch": PERMIT_ALL_VISITOR,
+    }
+    item = {
+        "uint32_result": 0, "bytes_err_msg": None,
+        "uint64_guild_id": str(gid),
+        "msg_guild_info": gi,
+        "msg_cmd_uin_info": {"uint32_is_member": 2 if joined else 0, "uint64_uin": 0},
+        "bytes_join_guild_sig": None,
+    }
+    return json.dumps({
+        "retcode": 0, "error": {"code": 0, "message": ""}, "message": "",
+        "data": {
+            "cmd0xf57_rsp": {"rpt_rsp_guild_info_list": [item]},
+            "cmd0xf5d_rsp": {"rpt_msg_guild_info_list": [{
+                "uint64_guild_id": str(gid), "msg_guild_info": {}, "msg_cmd_uin_info": {},
+                "rpt_msg_channel_list": chan_list, "rpt_msg_category_info": [],
+                "msg_no_classify_category_info": {},
+            }]},
+            "cmd0xf55_rsp": {"msg_channel_list": chan_list},
+        },
+    }, ensure_ascii=False).encode("utf-8")
+
+
+def _guild_num_from_referer(ref: str) -> str:
+    """从页面地址里取频道号：镜像页的地址形如 .../panel/g/<num>[/post/<id>]"""
+    m = re.search(r"/panel/g/([^/?#]+)", str(ref or ""))
+    return m.group(1) if m else ""
 
 
 def _looks_like_json(body: bytes) -> bool:
@@ -392,10 +609,7 @@ def _looks_like_json(body: bytes) -> bool:
 
 
 async def api_pd_proxy(request: web.Request) -> web.Response:
-    """把镜像页面的本站 API 请求透传给 pd.qq.com（携带当前槽位的 Cookie）。
-
-    宿主 match_route 前缀路由不会填充 match_info，tail 需从 request.path 截取。
-    """
+    """把镜像页面的本站 API 请求透传给 pd.qq.com（携带当前槽位的 Cookie）。"""
     prefix = "/api/ext/tencent-channel/pd/"
     path = request.path
     tail = path[len(prefix):] if path.startswith(prefix) else ""
@@ -413,6 +627,7 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
     cookie = _proxy_cookie(user)
     if cookie:
         headers["Cookie"] = cookie
+    page_gnum = _guild_num_from_referer(request.headers.get("Referer") or "")
     headers["Referer"] = "https://pd.qq.com/"
     headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
     try:
@@ -421,7 +636,6 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
         raise
     except Exception:
         # 客户端中途断开（刷新页面 / 关标签）时 aiohttp 以 ConnectionResetError 取消载荷，
-        # 此时连接已死、响应也无处可写，直接静默收尾，避免刷出一条 500 堆栈。
         return web.Response(status=499)
     # 上游偶发 5xx / 网络抖动：重试一次再放弃（腾讯网关抖一下很常见）
     resp = None
@@ -445,7 +659,6 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
     if resp is None:
         return web.json_response({"success": False, "retcode": -1, "message": f"上游请求失败: {last_error}"}, status=502)
     # 上游错误页通常不是 JSON；前端拿到会直接 JSON.parse 崩掉（Unexpected end of JSON input）。
-    # 网关类错误统一包成 JSON 信封，让页面按正常错误态处理。
     _ct = resp.headers.get("content-type", "")
     if resp.status_code >= 500 and not _ct.lower().startswith("application/json") and not _looks_like_json(resp.content):
         return web.json_response(
@@ -458,7 +671,7 @@ async def api_pd_proxy(request: web.Request) -> web.Response:
         if k.lower() not in ("content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie", "content-security-policy", "x-frame-options")
     }
     # 访客受限频道：让官方前端照常渲染（放开权限位 + 用插件账号数据合成 feeds 响应）
-    _official = await _try_official_frontend(url, body, resp.content, user)
+    _official = await _try_official_frontend(url, body, resp.content, user, page_gnum)
     if _official is not None:
         return web.Response(body=_official, status=200, content_type="application/json")
     ct = resp.headers.get("content-type", "application/octet-stream").split(";")[0]
@@ -501,7 +714,6 @@ _STATIC_TYPES = {
 
 
 # ==================== CLI 动作白名单 ====================
-# 每个动作: base=CLI 子命令, required/optional=参数名→CLI flag, extra=固定附加参数
 
 ACTIONS: Dict[str, Dict[str, Any]] = {
     "guilds": {"base": ["manage", "get-my-join-guild-info"]},
@@ -919,13 +1131,7 @@ async def api_accounts(request: web.Request):
 
 @register_route("POST", "/api/ext/tencent-channel/accounts/add")
 async def api_accounts_add(request: web.Request):
-    """添加账号：创建隔离槽位（或复用传入槽位）并返回登录二维码。
-
-    注意：添加账号**不改变当前槽位**。`create_auto_user()` 内部会 switch_user 到新槽位，
-    而新槽位还没登录 —— 那会让面板所有 CLI 操作立刻变成「未登录」、频道列表变空，
-    看起来像插件坏了（线上踩过）。扫码登录本身用显式 user 参数，不依赖「当前槽位」，
-    所以这里创建完就把当前槽位还原回去。想切换请用面板里的「切换账号」。
-    """
+    """添加账号：创建隔离槽位（或复用传入槽位）并返回登录二维码。"""
     body = await _json_body(request)
     prev_current = str(_load_users().get("current") or "")
     reuse = _safe_user_name(body.get("user"))
@@ -1013,13 +1219,20 @@ async def api_accounts_poll(request: web.Request):
     })
 
 
+def _slot_has_any() -> bool:
+    """任意槽位是否已登录（只看 token 文件，不起 CLI 进程）"""
+    try:
+        for name in (_load_users().get("users") or []):
+            if _slot_has_token(name):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 @register_route("GET", "/api/ext/tencent-channel/panel-cookie")
 async def api_panel_cookie(request: web.Request):
-    """当前槽位的 pd.qq.com Cookie 键值对（供注入脚本做虚拟会话 Cookie）。
-
-    页面 JS 通过 document.cookie 判断登录态（p_skey/p_uin），而镜像页跑在宿主域名下
-    天然没有 pd.qq.com 的浏览器 Cookie；真实鉴权仍由代理在服务端注入 Cookie 完成。
-    """
+    """当前槽位的 pd.qq.com Cookie 键值对（供注入脚本做虚拟会话 Cookie）。"""
     user = get_current_user()
     cookie = _read_user_cookie_file(user)
     pairs = {}
@@ -1029,11 +1242,20 @@ async def api_panel_cookie(request: web.Request):
             k = k.strip()
             if k:
                 pairs[k] = v.strip()
-    # session_valid=True 表示 Cookie 文件里有真实网页会话（p_skey）：
-    # 注入脚本据此决定是否给页面补虚拟登录态并接管评论等操作
+    synthetic = False
+    if "p_skey" not in pairs:
+        # 没有网页登录、但有可用的频道账号（CLI）时，给页面一个**虚拟会话标记**：
+        try:
+            has_cli = bool(_slot_has_any())
+        except Exception:
+            has_cli = False
+        if has_cli:
+            pairs = {"p_skey": "txpd_cli_virtual", "uin": "o0", "p_uin": "o0", "txpd_synthetic": "1"}
+            synthetic = True
     return web.json_response({
         "success": True,
-        "data": {"user": user, "cookies": pairs, "session_valid": "p_skey" in pairs},
+        "data": {"user": user, "cookies": pairs,
+                 "session_valid": "p_skey" in pairs, "synthetic": synthetic},
     })
 
 
@@ -1052,8 +1274,6 @@ async def api_accounts_delete(request: web.Request):
 
 
 # ==================== pd.qq.com 镜像静态资源 ====================
-# 宿主路由表只支持精确路径匹配（不支持 {name} 动态段），
-# 因此在插件加载时把 assets/ 内每个文件注册成精确路由（两种路径形态都注册）。
 
 
 def _make_static_handler(filename: str):
@@ -1104,20 +1324,12 @@ async def api_upload_image(request: web.Request):
 
 
 async def _serve_blocked(request: web.Request) -> web.Response:
-    """被注入脚本封锁的 qq 域请求统一落到这里。
-
-    返回 200 + 最小 JSON，而不是 204 空响应：调用方常用 res.json() 解析，
-    空响应会抛 "Unexpected end of JSON input"（控制台噪音）；请求本身不会触达 qq.com。
-    """
+    """被注入脚本封锁的 qq 域请求统一落到这里。"""
     return web.json_response({"retcode": 0, "data": {}, "message": ""})
 
 
 async def _serve_panel_index(request: web.Request) -> web.Response:
-    """SPA 导航兜底：baseURL 下的无后缀路径（如 /panel/explore）返回 index.html。
-
-    注意：/panel/* 前缀路由优先级低于已注册的精确路由（宿主 longest-prefix 在精确未命中时才生效），
-    所以静态资源（.js/.css 等）仍走精确路由；带后缀的未知文件拒绝兜底，防止把 404 误变成页面。
-    """
+    """SPA 导航兜底：baseURL 下的无后缀路径（如 /panel/explore）返回 index.html。"""
     tail = request.path[len("/api/ext/tencent-channel/panel/"):] if request.path.startswith("/api/ext/tencent-channel/panel/") else ""
     tail = tail.rstrip("/")
     # 含后缀（.xxx）的请求一律不兑底——未知静态文件必须 404，且防穿越（..%2f 解码后含 ..）
@@ -1132,8 +1344,6 @@ async def _serve_panel_index(request: web.Request) -> web.Response:
     except OSError:
         return web.Response(status=404, text="not found")
     # 深层路由（/g/<频道号>/post/<帖子>、/g/<频道号> 等）整页加载时剥离 explore 的 SSR 数据载荷：
-    # Nuxt 水合发现 payload 路径(/explore) 与当前路由不一致会 router.replace 回探索页，
-    # 导致帖子详情/频道视图永远落回探索页。剥离后该路由按纯客户端渲染（数据照常走代理）。
     if tail and tail != "explore":
         marker = b'<script type="application/json" data-nuxt-data="nuxt-app"'
         start = body.find(marker)
@@ -1145,9 +1355,6 @@ async def _serve_panel_index(request: web.Request) -> web.Response:
 
 
 # ==================== 网页登录（扫码；只影响页面显示，不参与点赞/评论等操作） ====================
-# 官方登录入口：xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=1600001587&daid=823（镜像页里抓到的原始参数）。
-# 流程全部在服务端完成：取二维码 → 轮询 ptqrlogin → 跟随跳转链收 Cookie → 落盘 data/pd-cookie.txt。
-# 只支持一个登录（单份 Cookie 文件），重新登录会覆盖上一个。
 
 _WEB_LOGIN_APPID = "1600001587"
 _WEB_LOGIN_DAID = "823"
@@ -1190,11 +1397,7 @@ def _cookie_header_of(client: httpx.Client) -> str:
 
 
 def _parse_ptui_cb(text: str) -> List[str]:
-    """解析 ptuiCB('code','arg2','url','arg4','msg','nick')。
-
-    各字段的分隔、引号转义、\\uXXXX 转义在不同版本/不同阶段（未扫码、已扫码、登录成功）并不一致，
-    所以这里不套固定模板：先取括号内参数串，再逐段抠引号内容，并对 \\uXXXX 做反转义。
-    """
+    """解析 ptuiCB('code','arg2','url','arg4','msg','nick')。"""
     m = re.search(r"ptuiCB\((.*)\)", text or "", re.S)
     if not m:
         return []
@@ -1429,7 +1632,6 @@ def _register_panel():
     # pd.qq.com 网关代理（前缀路由，透传页面本站 API 请求）
     register_route("*", "/api/ext/tencent-channel/pd/*", api_pd_proxy)
     # SPA 路由兜底：Nuxt baseURL 指向 panel/，vue-router 会把地址 rewrite 为 /panel/<path>，
-    # 这些无后缀路径必须返回 index.html，否则刷新/直接访问白屏
     register_route("GET", "/api/ext/tencent-channel/panel/*", _serve_panel_index)
 
     # 被封锁请求的静默端点：注入脚本把 qq 域请求改写到此处，返回 204 避免控制台 404 噪音

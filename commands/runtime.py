@@ -18,7 +18,6 @@ from core.plugin.decorators import handler
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 # 运行期数据统一收在插件目录的 data/ 下：账号槽位与登录态、网页 Cookie、计划任务与历史、
-# 发帖上传的图片、npm 本地安装的 CLI 等都在这里；插件根目录只留代码与随包二进制。
 DATA_DIR = BASE_DIR / "data"
 IS_WINDOWS = sys.platform.startswith("win")
 LOCAL_NPM_DIR = DATA_DIR / ".cli" / "node_modules"
@@ -31,14 +30,10 @@ LOCAL_CLI_BINS = (
 
 
 def _cli_env(user: Optional[str] = None) -> Dict[str, str]:
-    """CLI 子进程环境。多账号模式下每个账号槽位用独立的 HOME/USERPROFILE
-    （data/users/槽位名）隔离 ~/.qqcli 登录态；未创建任何槽位时保持原有行为：
-    Windows 用系统环境，Linux/macOS 在 HOME 缺失或不可写时回退到 data/.home。"""
+    """CLI 子进程环境。多账号模式下每个账号槽位用独立的 HOME/USERPROFILE"""
     env = dict(os.environ)
     if not IS_WINDOWS:
         # 禁用系统钥匙串（secret service）：钥匙串是全局存储，不随 HOME 隔离，
-        # 会导致多个账号槽位共用同一个 token；禁用后 CLI 自动回退到
-        # 按 HOME 落盘（~/.qqcli/.env），每个槽位的 token 各自隔离。
         env["DBUS_SESSION_BUS_ADDRESS"] = (
             "unix:path=/nonexistent-qqcli-keyring-disabled"
         )
@@ -74,8 +69,7 @@ def _ensure_executable(path: Path) -> None:
 
 
 def _resolve_cli() -> Optional[str]:
-    """CLI 查找顺序：插件目录内置二进制（Windows: exe/cmd；Linux/macOS: linux-x64 等）
-    → data/.cli 本地 npm 安装 → PATH（npm install -g tencent-channel-cli）。"""
+    """CLI 查找顺序：插件目录内置二进制（Windows: exe/cmd；Linux/macOS: linux-x64 等）"""
     if IS_WINDOWS:
         local_names = (
             "tencent-channel-cli.exe",
@@ -194,10 +188,7 @@ def add_user(name: Any) -> Tuple[bool, str]:
 
 
 def create_auto_user() -> Tuple[bool, str, str]:
-    """创建一个无需用户命名的内部账号身份。
-
-    账号目录仍按身份隔离，名称仅作为内部存储键，不再暴露给 Web 用户。
-    """
+    """创建一个无需用户命名的内部账号身份。"""
     for _ in range(8):
         name = f"account-{uuid.uuid4().hex[:10]}"
         ok, message = add_user(name)
@@ -249,8 +240,7 @@ def set_user_nickname(user: str, nickname: str) -> None:
 
 
 def _migrate_legacy_login(user: str) -> None:
-    """创建第一个槽位时，把旧版单账号的登录态（~/.qqcli）与 token_store 复制进槽位，
-    避免升级后需要重新扫码。失败不影响使用（重新登录即可）。"""
+    """创建第一个槽位时，把旧版单账号的登录态（~/.qqcli）与 token_store 复制进槽位，"""
     home = _user_home(user)
     try:
         legacy_homes = []
@@ -1166,10 +1156,7 @@ def _keychain_clear() -> None:
 
 
 def _migrate_keychain_to_slot(slot: str) -> None:
-    """CLI 找凭证的顺序是「钥匙串 → HOME/.qqcli/.env」，而钥匙串是全局唯一
-    的，会盖住所有槽位。发现钥匙串里有 token 时，把它落到归属槽位（旧版
-    owner 标记指向的槽位，否则当前槽位）自己的 .env 后清空钥匙串，此后每个
-    槽位只用自己目录里的 .env。"""
+    """CLI 找凭证的顺序是「钥匙串 → HOME/.qqcli/.env」，而钥匙串是全局唯一"""
     creds = _keychain_read()
     token = creds.get("token", "")
     if not token:
@@ -1225,10 +1212,6 @@ def _login_post_hook(args: List[str], ok: bool, output: str, slot: str) -> None:
 
 
 # ---------- CLI 专用线程池 ----------
-# 为什么不用 asyncio.to_thread：它用的是事件循环的**默认** executor，而宿主的插件文件监视器
-# （每 2 秒扫一次 mtime，用于热重载）等也共用它。一条 CLI 命令最长能占住线程 90 秒，
-# 默认池被 CLI 占满时热重载、通知轮询之类的任务会被饿死（线上出现过「改了文件不生效」）。
-# 这里给 CLI（以及其它阻塞调用）单独一个池，并限制并发，避免同一槽位被并发写坏。
 _CLI_POOL: Optional["ThreadPoolExecutor"] = None
 _CLI_POOL_LOCK = threading.Lock()
 
@@ -1303,19 +1286,12 @@ def _run_cli_raw(
         )
     try:
         # ``subprocess`` cannot execute a Windows ``.cmd`` shim directly when
-        # shell=False (the safe default).  Invoke it through COMSPEC while
-        # retaining argument boundaries; native ``.exe``/POSIX binaries keep
-        # the direct path for portability.
         command: List[str]
         if IS_WINDOWS and str(cli).lower().endswith((".cmd", ".bat")):
             command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", cli, *args]
         else:
             command = [cli, *args]
         # stdin 必须显式给定。CLI（qqcli/internal/ioutil.shouldReadStdin）只要发现 stdin
-        # 不是终端，就按「管道传参」一直读到 EOF —— 而守护进程（systemd / supervisord）给机器人
-        # 的 stdin 是永不写入也永不关闭的管道，子进程继承它就会永久阻塞在 read(0) 上，
-        # 最后撞这里的 90s 超时（线上表现：频道列表为空、面板所有操作都报失败）。
-        # 没有载荷时给 /dev/null（立即 EOF）；有载荷时才用 input= 喂管道。
         stdin_kwargs: Dict[str, Any] = (
             {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
         )

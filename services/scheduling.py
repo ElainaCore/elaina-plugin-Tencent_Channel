@@ -1,11 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""定时发帖调度器：标准 5 段 Cron (分 时 日 月 周)，支持 * , - / 语法。
-
-计划任务存储在 data/feed_schedules.json，通过 Web 面板管理。
-内容支持纯文本 / Markdown / HTML（HTML 自动转换为 Markdown 后发布），
-可附带图片与视频（本地路径或 URL）。
-"""
+"""定时发帖调度器：标准 5 段 Cron (分 时 日 月 周)，支持 * , - / 语法。"""
 
 import asyncio
 import datetime
@@ -288,11 +282,7 @@ def record_history(entry: Dict[str, Any]) -> None:
 
 
 def normalize_schedule(body: Dict[str, Any], require_channel: bool = True) -> Dict[str, Any]:
-    """校验并规范化一条计划任务，返回 {'error': ...} 或规范化后的任务。
-
-    require_channel=False 只用于「立即发帖」：官方发帖框本来就有「不选择版块」这一态，
-    CLI 的 --channel-id 也是可选项，缺省时由上游按频道默认版块处理。
-    """
+    """校验并规范化一条计划任务，返回 {'error': ...} 或规范化后的任务。"""
     cron = str(body.get("cron") or "").strip()
     if not cron_valid(cron):
         return {"error": "Cron 表达式无效，需为 5 段：分 时 日 月 周（支持 * , - /）"}
@@ -306,6 +296,20 @@ def normalize_schedule(body: Dict[str, Any], require_channel: bool = True) -> Di
     fmt = str(body.get("format") or "text").strip().lower()
     if fmt not in ("text", "md", "html"):
         return {"error": "格式必须是 text / md / html"}
+    # 帖子类型（CLI 语义）：1 = 短贴（≤1000 字），2 = 长贴（需标题，≤10000 字）
+    feed_type = str(body.get("feed_type") or "").strip()
+    title = str(body.get("title") or "").strip()
+    if fmt == "md":
+        # Markdown 只有长贴支持，且必须带标题（CLI 会直接拦掉，这里提前说清楚）
+        feed_type = "2"
+        if not title:
+            return {"error": "Markdown 仅长贴支持，需要填写标题"}
+    if feed_type == "2" and not title:
+        return {"error": "长文（长贴）需要填写标题"}
+    if feed_type not in ("", "1", "2"):
+        return {"error": "feed_type 只能是 1（短贴）或 2（长贴）"}
+    if feed_type != "2" and len(content) > 1000:
+        return {"error": "短贴最多 1000 字，长文请开启「长文」"}
 
     def _str_list(key: str) -> List[str]:
         raw = body.get(key) or []
@@ -321,7 +325,8 @@ def normalize_schedule(body: Dict[str, Any], require_channel: bool = True) -> Di
         "guild_id": guild_id,
         "channel_id": channel_id,
         "format": fmt,
-        "title": str(body.get("title") or "").strip(),
+        "feed_type": feed_type,
+        "title": title,
         "content": content,
         "images": _str_list("images"),
         "videos": _str_list("videos"),
@@ -348,6 +353,10 @@ def build_publish_args(schedule: Dict[str, Any]) -> List[str]:
     title = str(schedule.get("title") or "").strip()
     if title:
         args += ["--title", title]
+    # 1 = 短贴 / 2 = 长贴（有标题时 CLI 自己也会升级为长贴）
+    feed_type = str(schedule.get("feed_type") or "").strip()
+    if feed_type:
+        args += ["--feed-type", feed_type]
     fmt = schedule.get("format") or "text"
     content = str(schedule.get("content") or "")
     if fmt == "md":

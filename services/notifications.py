@@ -1,18 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""评论/回复私聊提醒 + 快速回复 + 评论列表图片渲染。
-
-轮询每个账号槽位的互动消息（feed get-notices），发现新的评论/回复后：
-1. 主动私聊 admins.txt 里的每个管理员（发帖人视角：有人评论了帖子、
-   或有人回复了评论都会提醒）；
-2. 同时抓取该帖子的完整评论列表，用 Pillow 渲染成图片随通知发给管理员
-   （未安装 Pillow 或缺中文字体时自动回退为文字列表）；
-3. 管理员发送「评论回复 内容」即可直接回复最近一条提醒的评论/回复
-   （自动用对应账号槽位的身份调用 feed do-reply）。
-
-指令：评论通知 开启/关闭、私信通知 开启/关闭（默认均开启）；通知间隔 秒数；私信冷却 秒数
-（同一人多条私信在冷却窗口内合并成一条提醒，默认 10 秒，0 为不合并）。
-"""
+"""评论/回复私聊提醒 + 快速回复 + 评论列表图片渲染。"""
 
 import asyncio
 import base64
@@ -397,8 +384,7 @@ def _newest_target(ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _target_from_item(
     item: Dict[str, Any], ctx: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """按通知里的 reply_id/comment_id 精确定位到对应那条评论/回复，
-    避免多条新通知都显示成最新一条；定位不到时退回最新一条。"""
+    """按通知里的 reply_id/comment_id 精确定位到对应那条评论/回复，"""
     reply_id = str(
         item.get("reply_id") or item.get("replyId") or item.get("target_reply_id") or ""
     ).strip()
@@ -713,8 +699,7 @@ async def _poll_slot(user: str) -> None:
 
 
 def _seed_subscription(user: str) -> None:
-    """check-notices 需要本地订阅标记；直接写槽位自己的订阅状态文件，
-    无需 CLI 的 OpenClaw 推送通道。"""
+    """check-notices 需要本地订阅标记；直接写槽位自己的订阅状态文件，"""
     base = _user_home(user) if user else Path.home()
     path = base / ".qqcli" / "subscription" / "state.json"
     try:
@@ -762,7 +747,6 @@ def _dm_fields(item: Dict[str, Any]) -> Dict[str, str]:
         or ""
     ).strip()
     # source_guild_id 是对方所在的真实频道；通知里的 guild_id 是私信会话 ID，
-    # 不能用作 push-group-dm-msg 的 --source-guild-id，单独存为 dm_guild_id
     guild = str(item.get("source_guild_id") or item.get("sourceGuildId") or "").strip()
     dm_guild = str(item.get("guild_id") or item.get("guildId") or "").strip()
     return {
@@ -785,8 +769,7 @@ def _decode_b64_nick(raw: str) -> str:
 
 
 def _parse_dm_msgs(stderr: str) -> List[Dict[str, str]]:
-    """从 check-notices 的日志里解析私信原始报文，拿到真正的发送人
-    tinyId/昵称/来源频道（check-notices 的 poster_nick 取的是自己那一侧）。"""
+    """从 check-notices 的日志里解析私信原始报文，拿到真正的发送人"""
     msgs: List[Dict[str, str]] = []
     for line in str(stderr or "").splitlines():
         if "rsp query_guild_channel_msg" not in line:
@@ -833,8 +816,7 @@ def _parse_dm_msgs(stderr: str) -> List[Dict[str, str]]:
 def _match_dm_msg(
     msgs: List[Dict[str, str]], item: Dict[str, Any]
 ) -> Optional[Dict[str, str]]:
-    """把通知项对应到原始私信：先按会话+正文匹配，退而求其次同会话任意一条
-    （同一私信会话的对方是固定的）。"""
+    """把通知项对应到原始私信：先按会话+正文匹配，退而求其次同会话任意一条"""
     dm_guild = str(item.get("guild_id") or item.get("guildId") or "").strip()
     summary = _notice_text(item)
     same_guild = [m for m in msgs if not dm_guild or m["dm_guild_id"] == dm_guild]
@@ -947,7 +929,6 @@ async def _poll_dm_slot(user: str) -> None:
     if not items:
         return
     # check-notices 本身是增量接口（CLI 自己维护基线），返回的都是新通知；
-    # 本地 seen 只做去重，不做首次基线吞掉。
     seen_path = (_user_home(user) if user else DATA_DIR) / "dm_notify_seen.json"
     data = _read_json_file(seen_path, {})
     seen = (
@@ -972,7 +953,6 @@ async def _poll_dm_slot(user: str) -> None:
             continue
         fields = _dm_fields(item)
         # 通知项里的 poster_nick/guild_name 是自己那一侧的昵称，不可用；
-        # 发送人要从同次拉取的私信原始报文里取 fromTinyId 对应的成员
         nick = ""
         msg = _match_dm_msg(dm_msgs, item)
         if msg:

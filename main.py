@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """腾讯频道插件入口：指令 / Web 管理面板 / 定时发帖调度器。"""
 
 from core.plugin.decorators import on_unload
@@ -23,6 +22,6 @@ def _txpd_unload():
 __plugin_meta__ = {
     "name": "腾讯频道(新)",
     "description": "腾讯频道管理：指令控制，Web管理面板，定时发帖",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "author": "ElainaBot",
 }

@@ -1,12 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""环境自检：Linux/macOS 下自动补全 tencent-channel-cli。
-
-查找顺序：插件目录内置二进制（如 tencent-channel-cli-linux-x64）→ data/.cli
-本地 npm 安装 → PATH。缺失时优先 npm 安装到 data/.cli（无需 root），
-失败再尝试 npm install -g。Windows 使用插件目录内置 tencent-channel-cli.exe，
-无需处理。
-"""
+"""环境自检：Linux/macOS 下自动补全 tencent-channel-cli。"""
 
 import asyncio
 import shutil
