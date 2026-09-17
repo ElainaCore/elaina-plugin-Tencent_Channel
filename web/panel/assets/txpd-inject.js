@@ -341,6 +341,54 @@
     }
   } catch (e) { /* 忽略 */ }
 
+  // ---------- 插件的浮层滚轮自管 ----------
+  // 官方浮层组件（assets/gui.*.js 的 preventWheelWhenOpen / preventEventWhenMouseNotInMenu）
+  // 在 window 捕获层对「鼠标不在它自己菜单里」的 wheel 一律 preventDefault，插件的浮层
+  // （版块下拉 #txpd-channel-dd 等）挂在 body 上、不属于它 → 原生滚动被压掉、列表滚不动。
+  // 这里在同一个捕获层先处理：自己滚 + 阻止应用那层再拦。必须早注册（脚本先于应用 bundle 执行）。
+  (function () {
+    try {
+      var LAYERS = ['#txpd-channel-dd', '#txpd-emoji-picker', '#txpd-lightbox', '#txpd-guild-dd'];
+      function hit(e) {
+        var t = e.target;
+        if (!t || !t.nodeType) return null;
+        for (var i = 0; i < LAYERS.length; i++) {
+          var box = document.querySelector(LAYERS[i]);
+          if (box && (box === t || box.contains(t))) return box;
+        }
+        return null;
+      }
+      window.addEventListener('wheel', function (e) {
+        var box = hit(e);
+        if (!box) return;
+        if (box.scrollHeight <= box.clientHeight + 1) return;   // 没得滚：让事件照常走
+        box.scrollTop += (e.deltaY || 0);
+        e.preventDefault();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      }, { capture: true, passive: false });
+      // 触发浮层（版块/表情）里的点击/触摸不要被应用的外点关闭逻辑抢走
+      ['touchstart', 'touchmove'].forEach(function (type) {
+        window.addEventListener(type, function (e) {
+          var box = hit(e);
+          if (!box) return;
+          if (type === 'touchmove' && box.scrollHeight > box.clientHeight + 1 && e.touches && e.touches[0]) {
+            // 触摸滑动：手动滚（应用同样会拦默认行为）
+            if (!box.__txpdTouchY) box.__txpdTouchY = 0;
+            var y = e.touches[0].clientY;
+            if (box.__txpdLastY != null) box.scrollTop += (box.__txpdLastY - y);
+            box.__txpdLastY = y;
+            e.preventDefault();
+          }
+          if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        }, { capture: true, passive: false });
+      });
+      window.addEventListener('touchend', function (e) {
+        var box = hit(e);
+        if (box) box.__txpdLastY = null;
+      }, { capture: true });
+    } catch (e) { /* 浮层滚轮自管失败不影响主流程 */ }
+  })();
+
   // ---------- 账号弹窗（插件自己的扫码登录，不经 qq 域） ----------
   function api(path, opts) {
     opts = opts || {};
@@ -452,6 +500,40 @@
     });
   }
 
+  // 复制到剪贴板：优先 Clipboard API（https/localhost），否则退回 execCommand
+  function legacyCopy(text) {
+    try {
+      var ta = el('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  }
+  function copyText(text, btn) {
+    if (!text) return;
+    var done = function () {
+      var old = btn.textContent;
+      btn.textContent = '✓ 已复制';
+      btn.disabled = true;
+      setTimeout(function () { btn.textContent = old; btn.disabled = false; }, 1600);
+      toast('已复制登录链接');
+    };
+    var fail = function () { toast('复制失败，请手动选中下方链接复制'); };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(function () {
+          if (legacyCopy(text)) done(); else fail();
+        });
+        return;
+      }
+    } catch (e) { /* 忽略，走兜底 */ }
+    if (legacyCopy(text)) done(); else fail();
+  }
+
   function renderQrStage() {
     stopPoll();
     dlg.innerHTML = '';
@@ -476,6 +558,31 @@
       var img = el('img', { src: 'data:image/png;base64,' + r.data.qr_code, alt: '登录二维码' });
       stage.appendChild(img);
       stage.appendChild(el('div', { id: 'txpd-qr-tip' }, '请使用手机 QQ 扫描二维码完成登录'));
+      // 登录链接（与二维码内容一致）：扫码不方便时，复制到手机上打开即可登录
+      var uri = String(r.data.verification_uri || '').trim();
+      if (uri) {
+        var linkRow = el('div', { id: 'txpd-qr-link' });
+        linkRow.style.cssText = 'margin-top:10px;display:flex;flex-direction:column;gap:6px;align-items:center;width:100%;';
+        var copyBtn = el('button', { 'class': 'txpd-acct-add', type: 'button', id: 'txpd-qr-copy' }, '复制登录链接');
+        copyBtn.style.cssText = 'height:32px;font-size:13px;';
+        copyBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          copyText(uri, copyBtn);
+        });
+        linkRow.appendChild(copyBtn);
+        // 同时把链接摆出来：复制失败 / 想转发到手机时可以直接选
+        var linkInput = el('input', {
+          id: 'txpd-qr-link-text',
+          readonly: 'readonly',
+          value: uri,
+          title: uri,
+          style: 'width:100%;max-width:340px;box-sizing:border-box;font-size:12px;color:#555;border:1px solid #e5e5e5;'
+            + 'border-radius:8px;padding:6px 8px;background:#fafafa;text-overflow:ellipsis;',
+        });
+        linkInput.addEventListener('click', function (e) { e.stopPropagation(); linkInput.select(); });
+        linkRow.appendChild(linkInput);
+        stage.appendChild(linkRow);
+      }
       var status = el('div', { id: 'txpd-qr-status' }, '等待扫码…');
       stage.appendChild(status);
       pollLogin(user, status);
@@ -778,6 +885,10 @@
   }
   function invalidateGuilds() {
     _guildsCache = null; _joinedKeys = null; _joinedNames = null;
+    _guildsError = '';      // 手动失效（加入/退出后）→ 立即允许重取
+    _guildsEmptyTs = 0;
+    _joinedSig = '';        // 让下一次渲染强制重建
+    _joinedNode = null;
     try { window.localStorage.removeItem(guildCacheKey()); } catch (e) { /* 忽略 */ }
   }
 
@@ -825,7 +936,8 @@
         syncLikedMarks();
         ensureGuildMeta();
         ensureGatedFallback();
-      }).catch(function () { /* 忽略 */ });
+      }).catch(function () { /* 拉取失败：下面照样重画，让分区显示失败态并继续自动重试 */ })
+        .then(function () { renderJoinedList(); });
     }).catch(function () { /* 忽略 */ });
     // 记录当前深层路径，宿主页面刷新后恢复位置
     try {
@@ -1623,9 +1735,16 @@
   }
 
   var _guildsLoading = null;
+  var _guildsError = '';     // 最近一次拉取失败的原因（空串 = 无错）
+  var _guildsEmptyTs = 0;    // 上次「成功但为空」的时间：60s 内不重复打 CLI，之后自动重试
+  var _joinedSig = '';       // 已加入列表的渲染签名：状态没变就不重建 DOM
+  var _joinedNode = null;    // 上次渲染写进的那个 list 节点（应用会重建侧栏，节点换了必须重画）
   function loadJoinedGuilds() {
-    if (_guildsCache) return Promise.resolve(_guildsCache);
+    // 命中缓存（有列表可显示）就不该再顶着上一次的失败态
+    if (_guildsCache && _guildsCache.length) { _guildsError = ''; return Promise.resolve(_guildsCache); }
     if (_guildsLoading) return _guildsLoading;
+    // 真·空结果是合法状态，但没必要每 3 秒都去起一次 CLI；失败则每轮都重试
+    if (!_guildsError && _guildsEmptyTs && Date.now() - _guildsEmptyTs < 60000) return Promise.resolve([]);
     // localStorage 1 小时缓存：频道列表加载慢（CLI 约 4s），缓存后秒出且无闪烁
     try {
       var raw = window.localStorage.getItem(guildCacheKey());
@@ -1633,12 +1752,20 @@
         var box = JSON.parse(raw);
         if (box && Array.isArray(box.guilds) && Date.now() - box.ts < 3600000 && box.guilds.length) {
           setJoinedCache(box.guilds);
+          _guildsError = '';       // 本地缓存里有列表 → 先按「有频道」渲染，别再显示失败
+          _guildsEmptyTs = 0;
           return Promise.resolve(_guildsCache);
         }
       }
     } catch (e) { /* 忽略损坏缓存 */ }
     _guildsLoading = api('/cli', { method: 'POST', body: { action: 'guilds', params: {} } }).then(function (r) {
-      if (!r.success) return []; // 未登录等：不缓存，登录后下次轮询重取
+      // 拉取失败 ≠ 没有频道：以前把失败也当成空列表，界面就显示成「暂无已加入的频道」，
+      // 而且分区只画一次，登录态恢复后也不会自愈。这里如实记录失败原因。
+      if (!r.success) {
+        _guildsError = String((r && r.message) || 'CLI 调用失败').slice(0, 120);
+        throw new Error(_guildsError);
+      }
+      _guildsError = '';
       var data = (r.data && r.data.data) || {};
       var seen = {}, all = [];
       // 三个列表都要算「已加入」：created（我创建的）/ managed（我是管理员·小管家）/
@@ -1647,7 +1774,10 @@
         if (g && g.guild_id && !seen[g.guild_id]) { seen[g.guild_id] = 1; all.push(g); }
       });
       setJoinedCache(all);
-      try { window.localStorage.setItem(guildCacheKey(), JSON.stringify({ ts: Date.now(), guilds: all })); } catch (e) { /* 忽略 */ }
+      _guildsEmptyTs = all.length ? 0 : Date.now();
+      if (all.length) {
+        try { window.localStorage.setItem(guildCacheKey(), JSON.stringify({ ts: Date.now(), guilds: all })); } catch (e) { /* 忽略 */ }
+      }
       return all;
     }).then(function (all) {
       _guildsLoading = null;
@@ -1657,6 +1787,52 @@
       throw e;
     });
     return _guildsLoading;
+  }
+  // 「已加入的频道」分区的三态：ok / empty / error（loading 只在首次）
+  function renderJoinedList() {    var list = document.querySelector('.aside-group--txpd-joined .unjoin-guild-list');
+    if (!list) return;
+    var state = _guildsError ? 'error' : ((_guildsCache && _guildsCache.length) ? 'ok' : (_guildsCache ? 'empty' : 'loading'));
+    var sig = state + '|' + _guildsError + '|' + ((_guildsCache || []).map(function (g) {
+      return (g.guild_id || '') + ':' + (g.guild_number || '') + ':' + (g.name || '');
+    }).join(','));
+    // 状态没变且还是同一个节点 → 不动 DOM（避免每 3 秒打断 hover/滚动）；
+    // 但节点被应用重建过（侧栏重渲染）时即使状态没变也必须重画，否则新节点会一直停在
+    // 创建时的「加载中…」占位 —— 线上「加载失败后永远不自愈」就是这么来的。
+    if (sig === _joinedSig && list === _joinedNode) return;
+    _joinedSig = sig;
+    _joinedNode = list;
+    list.innerHTML = '';
+    if (state === 'error') {
+      list.appendChild(el('div', {
+        'class': 'txpd-joined-err', 'data-txpd-state': 'error',
+        style: 'font-size:12px;color:#e5484d;padding:6px 8px;line-height:1.6;',
+      }, '频道列表加载失败：' + _guildsError + '，正在自动重试…'));
+      return;
+    }
+    if (state !== 'ok') {
+      list.appendChild(el('div', { style: 'font-size:12px;color:#999;padding:6px 8px;' },
+        state === 'loading' ? '加载中…' : '暂无已加入的频道'));
+      return;
+    }
+    var guilds = _guildsCache;
+    guilds.forEach(function (g, idx) {
+      var wrap = el('div');
+      wrap.setAttribute('index', String(idx));
+      var item = el('div', {
+        'class': 'my-guild-item',
+        'data-gnum': g.guild_number || '',
+        'title': (g.name || '') + '（' + (g.role || '成员') + '），点击进入频道',
+      });
+      var av = el('div', { 'class': 'item-avatar-wrap' });
+      item._txpdGuild = g;   // 头像要反复补（官方那份异步渲染），这里留着数据源的引用
+      av.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
+      item.appendChild(av);
+      item.appendChild(el('div', { 'class': 'item-name ellipsis' }, g.name || g.guild_number || ''));
+      item.addEventListener('click', function () { openGuildView(g); });
+      paintJoinedAvatar(item, g);   // 拿得到地址就直接上真头像（官方参数 / CLI 头像）
+      wrap.appendChild(item);
+      list.appendChild(wrap);
+    });
   }
 
   // 点击已加入的频道 → 应用内路由进入频道视图（与「未加入的频道」卡片一致，不刷新页面）
@@ -1794,6 +1970,23 @@
     return d;
   }
 
+  // 调试钩子：分区为什么显示成这样，一眼能看出来（排查线上「暂无已加入的频道」时很有用）
+  window.__txpdJoinedDebug = function () {
+    return {
+      error: _guildsError,
+      cached: _guildsCache ? _guildsCache.length : null,
+      emptyTs: _guildsEmptyTs,
+      sig: _joinedSig,
+      sameNode: _joinedNode ? (_joinedNode === document.querySelector('.aside-group--txpd-joined .unjoin-guild-list')) : null,
+      loading: !!_guildsLoading,
+      sections: document.querySelectorAll('.aside-group--txpd-joined').length,
+      listText: (function () {
+        var l = document.querySelector('.aside-group--txpd-joined .unjoin-guild-list');
+        return l ? (l.innerText || '').split(String.fromCharCode(10)).join(' | ') : '(no list)';
+      })(),
+    };
+  };
+
   function ensureJoinedSection() {
     var nav = document.querySelector('.aside-nav');
     if (!nav) return;
@@ -1832,33 +2025,14 @@
       var entry2 = document.getElementById('txpd-acct-entry');
       if (entry2) entry2.textContent = any ? '切换账号' : '扫码登录';
     }).catch(function () { /* 忽略 */ });
-    loadJoinedGuilds().then(function (guilds) {
-      var list2 = document.querySelector('.aside-group--txpd-joined .unjoin-guild-list');
-      if (!list2) return;
-      list2.innerHTML = '';
-      if (!guilds.length) {
-        list2.appendChild(el('div', { style: 'font-size:12px;color:#999;padding:6px 8px;' }, '暂无已加入的频道'));
-      }
-      guilds.forEach(function (g, idx) {
-        var wrap = el('div');
-        wrap.setAttribute('index', String(idx));
-        var item = el('div', {
-          'class': 'my-guild-item',
-          'data-gnum': g.guild_number || '',
-          'title': (g.name || '') + '（' + (g.role || '成员') + '），点击进入频道',
-        });
-        var av = el('div', { 'class': 'item-avatar-wrap' });
-        item._txpdGuild = g;   // 头像要反复补（官方那份异步渲染），这里留着数据源的引用
-        av.appendChild(avatarPlaceholder(g.name || g.guild_number || '?'));
-        item.appendChild(av);
-        item.appendChild(el('div', { 'class': 'item-name ellipsis' }, g.name || g.guild_number || ''));
-        item.addEventListener('click', function () { openGuildView(g); });
-        paintJoinedAvatar(item, g);   // 拿得到地址就直接上真头像（官方参数 / CLI 头像）
-        wrap.appendChild(item);
-        list2.appendChild(wrap);
-      });
-
-    }).catch(function () { /* CLI 未登录等，忽略 */ });
+    // 渲染交给 renderJoinedList：它区分「加载失败 / 真的没有 / 正常」三态，
+    // 并且状态没变就不重建 DOM（每 3 秒的轮询不会打断 hover）
+    renderJoinedList();
+    loadJoinedGuilds().then(function () {
+      renderJoinedList();
+    }).catch(function () {
+      renderJoinedList();
+    });
   }
 
   // ---------- 通用小面板（对话框内容切换用） ----------
@@ -1979,10 +2153,12 @@
   }
 
   var _channelsCache = {};
-  function loadGuildChannels(g) {
+  function loadGuildChannels(g, force) {
     var c = _channelsCache[g.guild_id];
-    if (c && Date.now() - c.ts < 600000) return Promise.resolve(c.channels);
+    // 失败结果不缓存：一次超时不该让人以为这个频道没有版块、还要等 10 分钟
+    if (!force && c && Date.now() - c.ts < 600000) return Promise.resolve(c.channels);
     return api('/cli', { method: 'POST', body: { action: 'channels', params: { guild_id: g.guild_id } } }).then(function (r) {
+      if (!r.success) throw new Error(String((r && r.message) || '版块拉取失败').slice(0, 80));
       var channels = (r.data && r.data.data && r.data.data.channels) || [];
       _channelsCache[g.guild_id] = { ts: Date.now(), channels: channels };
       return channels;
@@ -1993,15 +2169,16 @@
   }
   function buildScheduleForm(dlgP, preGuild) {
     var cur = preGuild && preGuild.num ? preGuild.num : currentGuildNumber();
+    var guilds0 = _guildsCache || [];    // 没加载出来（或刚被失效）时不能直接 forEach
     var gSel = el('select'); gSel.style.cssText = selectStyle();
-    _guildsCache.forEach(function (g) {
+    guilds0.forEach(function (g) {
       var o = el('option', { value: g.guild_id }, (g.name || g.guild_number) + (g.role && g.role !== '成员' ? '（' + g.role + '）' : ''));
       o.value = g.guild_id;
       gSel.appendChild(o);
     });
     if (cur) {
-      for (var gi = 0; gi < _guildsCache.length; gi++) {
-        if (_guildsCache[gi].guild_number === cur) { gSel.value = _guildsCache[gi].guild_id; break; }
+      for (var gi = 0; gi < guilds0.length; gi++) {
+        if (guilds0[gi].guild_number === cur) { gSel.value = guilds0[gi].guild_id; break; }
       }
     }
     var cSel = el('select'); cSel.style.cssText = selectStyle();
@@ -2171,6 +2348,18 @@
       else if (token) { params.next_page_token = token; }
       var action = kw ? 'member-search' : 'members';
       api('/cli', { method: 'POST', body: { action: action, params: params } }).then(function (r) {
+        if (!r.success) {
+          // 拉取失败 ≠ 没有成员：以前会显示「暂无成员」，看起来像频道是空的
+          var reason = String((r && r.message) || '加载失败').slice(0, 80);
+          if (!box.children.length) {
+            box.appendChild(el('div', { style: 'color:#e5484d;font-size:13px;padding:14px 0;text-align:center;' },
+              '成员加载失败：' + reason));
+          }
+          more.textContent = '加载失败，点此重试';
+          more.style.display = 'block';
+          more.disabled = false;
+          return;
+        }
         var data = (r.data && r.data.data) || {};
         var members = data.members || [];
         if (reset) box.innerHTML = '';
@@ -2445,8 +2634,16 @@
     card3.appendChild(row3);
     page.appendChild(card3);
     api('/admins').then(function (r) {
-      if (r.success && r.data && r.data.admins) ta.value = r.data.admins.join('\n');
-    }).catch(function () { /* 忽略 */ });
+      if (!r.success) throw new Error((r && r.message) || '加载失败');
+      ta.value = ((r.data && r.data.admins) || []).join('\n');
+      st3.textContent = '';
+    }).catch(function (e) {
+      // 读不到就别说成「空」——否则用户一保存就把管理员列表清空了
+      ta.value = '';
+      ta.disabled = true;
+      save.disabled = true;
+      panelError(st3, '管理员列表加载失败：' + String((e && e.message) || e).slice(0, 60) + '（为避免误清空已禁用保存，请刷新重试）');
+    });
     save.addEventListener('click', function () {
       save.disabled = true;
       st3.style.color = '#888';
@@ -2598,6 +2795,7 @@
     if (!force && now - _schedTs < 3000) return;
     _schedTs = now;
     api('/schedules').then(function (r) {
+      if (r && r.success === false) throw new Error((r && r.message) || '加载失败');
       var list = (r && r.data && r.data.schedules) || [];
       // 数据没变就不重建 DOM：避免每 3 秒闪一次、把滚动位置顶回去
       var sig = JSON.stringify(list);
@@ -3135,6 +3333,8 @@
     var hint = (container.querySelector('[data-txpd-editor-added]') || container).querySelector('.editor-header .user-name');
     if (hint && joined) hint.textContent = '发帖将以 CLI 当前账号身份发表，点击输入框开始';
     if (!joined && !unknown && container.getAttribute('data-txpd-expanded') === '1') {
+      // 版块/表情浮层开着时先不收：收起会把挂在 body 上的浮层一起摘掉，用户正选版块就没了
+      if (document.getElementById('txpd-channel-dd') || document.getElementById('txpd-emoji-picker')) return;
       collapsePublishEditor(container);   // 明确没加入：收起，交还官方节点
     }
   }
@@ -3749,12 +3949,18 @@
     // 版块选择下拉（chose-channel 按钮）
     var channels = [];
     var channelsLoaded = false;
-    function loadChannels() {
-      return loadGuildChannels({ guild_id: ctx.id }).then(function (chs) {
+    var channelsErr = '';
+    function loadChannels(force) {
+      return loadGuildChannels({ guild_id: ctx.id }, force).then(function (chs) {
         channels = chs || [];
+        channelsErr = '';
         channelsLoaded = true;
         return channels;
-      }).catch(function () { channelsLoaded = true; return channels; });
+      }).catch(function (e) {
+        channelsErr = String((e && e.message) || e || '加载失败').slice(0, 60);
+        channelsLoaded = true;
+        return channels;
+      });
     }
     loadChannels();
     // 版块浮层用 fixed 定位贴在按钮上方。以前是塞进 .chose-channel 里（position:absolute），
@@ -3763,7 +3969,16 @@
       var exist = document.getElementById('txpd-channel-dd');
       if (exist && exist.parentNode) exist.parentNode.removeChild(exist);
       document.removeEventListener('click', onDocClickForDD, true);
-      window.removeEventListener('scroll', closeChannelDD, true);
+      window.removeEventListener('scroll', onScrollCloseDD, true);
+    }
+    // scroll 不冒泡，但 window 捕获层照样能收到「浮层内部」的滚动 —— 那不算页面滚动，
+    // 否则列表刚滚一格就被关掉（用户看到的是「一拉就消失」）
+    function onScrollCloseDD(ev) {
+      var dd0 = document.getElementById('txpd-channel-dd');
+      if (!dd0) return;
+      var t = ev.target;
+      if (t === dd0 || (t && t.nodeType === 1 && dd0.contains(t))) return;
+      if (t === document || t === window) closeChannelDD();
     }
     function onDocClickForDD(ev) {
       var dd0 = document.getElementById('txpd-channel-dd');
@@ -3786,17 +4001,20 @@
             ? ('top:' + Math.max(8, r0.top - 6) + 'px;transform:translateY(-100%);')
             : ('top:' + Math.min(window.innerHeight - 60, r0.bottom + 6) + 'px;'))
           + 'background:#fff;border:1px solid #e5e5e5;border-radius:8px;'
-          + 'box-shadow:0 4px 16px rgba(0,0,0,.14);min-width:180px;max-width:320px;max-height:240px;overflow:auto;';
+          + 'box-shadow:0 4px 16px rgba(0,0,0,.14);min-width:180px;max-width:320px;max-height:240px;'
+          + 'overflow:auto;overscroll-behavior:contain;';   // 滚到两头不连锁滚页面
         function paint() {
           dd.innerHTML = '';
           if (!channelsLoaded) { dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '版块加载中…')); return; }
           if (!channels.length) {
             // 拉不到版块也要能发帖：官方「不选择版块」本来就是合法状态
-            dd.appendChild(el('div', { style: 'padding:10px 12px;font-size:13px;color:#999;' }, '没读到版块（可直接发表）'));
+            dd.appendChild(el('div', {
+              style: 'padding:10px 12px;font-size:13px;color:' + (channelsErr ? '#e5484d' : '#999') + ';',
+            }, channelsErr ? ('版块拉取失败：' + channelsErr + '（可直接发表）') : '没读到版块（可直接发表）'));
             var retry = el('div', { style: 'padding:8px 12px;font-size:13px;cursor:pointer;color:#2b64f5;' }, '重新加载');
             retry.addEventListener('click', function (ev) {
               ev.stopPropagation();
-              channelsLoaded = false; paint(); loadChannels().then(paint);
+              channelsLoaded = false; paint(); loadChannels(true).then(paint);
             });
             dd.appendChild(retry);
             return;
@@ -3821,7 +4039,7 @@
         document.body.appendChild(dd);
         setTimeout(function () {
           document.addEventListener('click', onDocClickForDD, true);
-          window.addEventListener('scroll', closeChannelDD, true);
+          window.addEventListener('scroll', onScrollCloseDD, true);
         }, 0);
       });
     }
@@ -4884,7 +5102,7 @@
   }
 
   // ---------- 动态页（复刻官方 /index 布局，数据走 CLI 聚合） ----------
-  var _dyn = { tab: 'hot', feeds: [], seen: {}, gidx: 0, loading: false, done: false, started: false, icons: {} };
+  var _dyn = { tab: 'hot', feeds: [], seen: {}, gidx: 0, loading: false, done: false, started: false, icons: {}, err: '', failCount: 0 };
   function dynIconKey() { return 'txpd_guild_icons_v1_' + (TXPD_USER || 'default'); }
   function dynIconCache() {
     try { return JSON.parse(window.localStorage.getItem(dynIconKey()) || '{}') || {}; } catch (e) { return {}; }
@@ -5005,6 +5223,13 @@
     }
     return arr;
   }
+  // 重新加载动态流：清掉游标与失败标记
+  function dynReset() {
+    _dyn.gidx = 0; _dyn.done = false; _dyn.loading = false;
+    _dyn.err = ''; _dyn.failCount = 0; _dyn.seen = {}; _dyn.feeds = [];
+    dynRender();
+    dynLoadMore();
+  }
   function dynRender() {
     var content = document.querySelector('.txpd-dynamic .feed-list-content');
     if (!content) return;
@@ -5012,8 +5237,16 @@
     var list = dynSorted();
     if (!list.length) {
       var empty = el('div', { 'class': 'feed-list-content-empty', 'data-v-0c4f7dca': '' });
-      empty.appendChild(el('div', { 'class': 'feed-list-content-empty-tip', 'data-v-0c4f7dca': '' }, _dyn.loading ? '正在加载动态…' : '暂无新动态'));
-      if (!_dyn.loading) {
+      if (_dyn.loading) {
+        empty.appendChild(el('div', { 'class': 'feed-list-content-empty-tip', 'data-v-0c4f7dca': '' }, '正在加载动态…'));
+      } else if (_dyn.err) {
+        // 全部/部分频道拉取失败：别显示成「暂无新动态」（那是「真的没有」）
+        empty.appendChild(el('div', { 'class': 'feed-list-content-empty-tip', 'data-v-0c4f7dca': '' }, '动态加载失败：' + _dyn.err));
+        var retry = el('div', { 'class': 'feed-list-content-empty-button', 'data-v-0c4f7dca': '' }, '重新加载');
+        retry.addEventListener('click', function () { dynReset(); });
+        empty.appendChild(retry);
+      } else {
+        empty.appendChild(el('div', { 'class': 'feed-list-content-empty-tip', 'data-v-0c4f7dca': '' }, '暂无新动态'));
         var btn = el('div', { 'class': 'feed-list-content-empty-button', 'data-v-0c4f7dca': '' }, '去看看');
         btn.addEventListener('click', function () { spaNavigate('explore'); });
         empty.appendChild(btn);
@@ -5042,6 +5275,11 @@
     dynRender();
     Promise.all(batch.map(function (g) {
       return api('/cli', { method: 'POST', body: { action: 'feeds', params: { guild_id: g.guild_id, count: 10 } } }).then(function (r) {
+        if (r && r.success === false) {
+          _dyn.failCount = (_dyn.failCount || 0) + 1;
+          _dyn.err = String((r && r.message) || 'CLI 调用失败').slice(0, 60);
+          return;
+        }
         var feeds = (r.data && r.data.data && r.data.data.feeds) || [];
         feeds.forEach(function (f) {
           if (!f || !f.feed_id || _dyn.seen[f.feed_id]) return;
@@ -5051,9 +5289,14 @@
           f.guild_display = g.name || f.guild_name || g.guild_number;
           _dyn.feeds.push(f);
         });
-      }).catch(function () { /* 单频道失败不影响整体 */ });
+      }).catch(function (e) {
+        // 单频道失败不影响整体，但要记下来：全空时得说清楚是失败而不是「没有动态」
+        _dyn.failCount = (_dyn.failCount || 0) + 1;
+        _dyn.err = String((e && e.message) || e || '加载失败').slice(0, 60);
+      });
     })).then(function () {
       _dyn.loading = false;
+      if (_dyn.feeds.length) { _dyn.err = ''; _dyn.failCount = 0; }
       _dyn.icons = dynIconCache();
       batch.forEach(function (g) {
         if (_dyn.icons[g.guild_id]) return;

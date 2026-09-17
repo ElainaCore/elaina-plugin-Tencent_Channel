@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import urllib.parse
@@ -388,7 +389,7 @@ async def _do_login(event, force: bool) -> None:
         )
         return
     args = ["login", "--json"] + (["--yes"] if force else [])
-    ok, output = await asyncio.to_thread(_run_cli, args)
+    ok, output = await run_cli_async(args)
     data = _extract_json(_normalize_rate_limit(output))
     payload = (
         data.get("data")
@@ -1223,6 +1224,48 @@ def _login_post_hook(args: List[str], ok: bool, output: str, slot: str) -> None:
         _write_slot_env(slot, {ENV_TOKEN_KEY: "", ENV_DEVICE_KEY: ""})
 
 
+# ---------- CLI 专用线程池 ----------
+# 为什么不用 asyncio.to_thread：它用的是事件循环的**默认** executor，而宿主的插件文件监视器
+# （每 2 秒扫一次 mtime，用于热重载）等也共用它。一条 CLI 命令最长能占住线程 90 秒，
+# 默认池被 CLI 占满时热重载、通知轮询之类的任务会被饿死（线上出现过「改了文件不生效」）。
+# 这里给 CLI（以及其它阻塞调用）单独一个池，并限制并发，避免同一槽位被并发写坏。
+_CLI_POOL: Optional["ThreadPoolExecutor"] = None
+_CLI_POOL_LOCK = threading.Lock()
+
+
+def blocking_pool():
+    global _CLI_POOL
+    with _CLI_POOL_LOCK:
+        if _CLI_POOL is None:
+            _CLI_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="txpd-blocking")
+        return _CLI_POOL
+
+
+async def run_blocking(fn, *args):
+    """在插件专用线程池里跑阻塞函数（CLI 调用、同步 HTTP 等）。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(blocking_pool(), functools.partial(fn, *args))
+
+
+async def run_cli_async(
+    args: List[str], stdin_text: Optional[str] = None, user: Optional[str] = None
+) -> Tuple[bool, str]:
+    """异步跑一次 CLI（走专用线程池，不占默认 executor）。"""
+    return await run_blocking(_run_cli, args, stdin_text, user)
+
+
+def shutdown_blocking_pool() -> None:
+    """插件卸载时收尾：池里的线程不是 daemon，不释放会拖住进程退出。"""
+    global _CLI_POOL
+    with _CLI_POOL_LOCK:
+        pool, _CLI_POOL = _CLI_POOL, None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
+
+
 def _run_cli(
     args: List[str], stdin_text: Optional[str] = None, user: Optional[str] = None
 ) -> Tuple[bool, str]:
@@ -1268,9 +1311,16 @@ def _run_cli_raw(
             command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", cli, *args]
         else:
             command = [cli, *args]
+        # stdin 必须显式给定。CLI（qqcli/internal/ioutil.shouldReadStdin）只要发现 stdin
+        # 不是终端，就按「管道传参」一直读到 EOF —— 而守护进程（systemd / supervisord）给机器人
+        # 的 stdin 是永不写入也永不关闭的管道，子进程继承它就会永久阻塞在 read(0) 上，
+        # 最后撞这里的 90s 超时（线上表现：频道列表为空、面板所有操作都报失败）。
+        # 没有载荷时给 /dev/null（立即 EOF）；有载荷时才用 input= 喂管道。
+        stdin_kwargs: Dict[str, Any] = (
+            {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+        )
         proc = subprocess.run(
             command,
-            input=stdin_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1278,6 +1328,7 @@ def _run_cli_raw(
             cwd=str(BASE_DIR),
             env=_cli_env(user),
             timeout=90,
+            **stdin_kwargs,
         )
     except subprocess.TimeoutExpired:
         return False, "命令执行超时", ""

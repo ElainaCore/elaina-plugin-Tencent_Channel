@@ -36,6 +36,8 @@ from ..commands.shared import (
     _read_json_file,
     _run_cli,
     _run_cli_full,
+    run_blocking,
+    run_cli_async,
     _set_setting,
     _set_switch,
     _text,
@@ -656,8 +658,7 @@ async def _notify_admins(
 
 
 async def _poll_slot(user: str) -> None:
-    ok, output = await asyncio.to_thread(
-        _run_cli, ["feed", "get-notices", "--json"], None, user or None
+    ok, output = await run_cli_async( ["feed", "get-notices", "--json"], None, user or None
     )
     if not ok:
         return
@@ -1133,7 +1134,7 @@ async def handle_quick_reply(event, match):
         ]
         if ctx.get("target_user_nick"):
             args[2:2] = ["--target-user-nick", ctx["target_user_nick"]]
-    ok, output = await asyncio.to_thread(_run_cli, args, None, user or None)
+    ok, output = await run_cli_async( args, None, user or None)
     output = _normalize_rate_limit(output)
     nick = ctx.get("target_user_nick") or ctx.get("nick") or "对方"
     if ok:
@@ -1185,7 +1186,7 @@ async def handle_dm_reply(event, match):
     else:
         await event.reply("这条私信提醒缺少对方信息，无法直接回复")
         return
-    ok, output = await asyncio.to_thread(_run_cli, args, None, user or None)
+    ok, output = await run_cli_async( args, None, user or None)
     output = _normalize_rate_limit(output)
     nick = found.get("nick") or "对方"
     if ok:

@@ -69,6 +69,8 @@ from ..commands.shared import (
     get_current_user,
     list_users,
     remove_user,
+    run_blocking,
+    run_cli_async,
     set_user_nickname,
     switch_user,
 )
@@ -607,7 +609,7 @@ def _build_action_args(action: str, params: Dict[str, Any], user: str = "") -> A
 async def _run_cli_json(args: List[str], user: str = "", stdin: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # 少数流程（如带附言/答题的加入频道）CLI 从 stdin 收 JSON 载荷
     stdin_text = json.dumps(stdin, ensure_ascii=False, separators=(",", ":")) if stdin else None
-    ok, output = await asyncio.to_thread(_run_cli, args, stdin_text, user or None)
+    ok, output = await run_cli_async(args, stdin_text, user or None)
     output = _normalize_rate_limit(output)
     data = _extract_json(output)
     result: Dict[str, Any] = {"success": ok}
@@ -882,7 +884,7 @@ async def api_publish_feed(request: web.Request):
     if "error" in normalized:
         return web.json_response({"success": False, "message": normalized["error"]})
     feed_scheduler.record_history({**normalized, "kind": "publish"})
-    result = await asyncio.to_thread(feed_scheduler.run_schedule_sync, normalized)
+    result = await run_blocking(feed_scheduler.run_schedule_sync, normalized)
     return web.json_response({"success": result["ok"], "message": result["message"]})
 
 
@@ -917,8 +919,15 @@ async def api_accounts(request: web.Request):
 
 @register_route("POST", "/api/ext/tencent-channel/accounts/add")
 async def api_accounts_add(request: web.Request):
-    """添加账号：创建隔离槽位（或复用传入槽位）并返回登录二维码。"""
+    """添加账号：创建隔离槽位（或复用传入槽位）并返回登录二维码。
+
+    注意：添加账号**不改变当前槽位**。`create_auto_user()` 内部会 switch_user 到新槽位，
+    而新槽位还没登录 —— 那会让面板所有 CLI 操作立刻变成「未登录」、频道列表变空，
+    看起来像插件坏了（线上踩过）。扫码登录本身用显式 user 参数，不依赖「当前槽位」，
+    所以这里创建完就把当前槽位还原回去。想切换请用面板里的「切换账号」。
+    """
     body = await _json_body(request)
+    prev_current = str(_load_users().get("current") or "")
     reuse = _safe_user_name(body.get("user"))
     if reuse:
         data = _load_users()
@@ -938,6 +947,12 @@ async def api_accounts_add(request: web.Request):
             ok, user, message = create_auto_user()
             if not ok:
                 return web.json_response({"success": False, "message": message})
+    # 还原当前槽位（新建槽位时 add_user/create_auto_user 会把它改掉）
+    if prev_current and prev_current != user:
+        try:
+            switch_user(prev_current)
+        except Exception:
+            pass
     ok, output = await asyncio.to_thread(
         _run_cli, ["login", "--json", "--qrcode-path", str(USERS_DIR / user / "login-qrcode.png")], None, user
     )
@@ -967,7 +982,7 @@ async def api_accounts_poll(request: web.Request):
     if task is None:
 
         async def _do_poll():
-            ok, output = await asyncio.to_thread(_run_cli, ["login", "poll-token", "--json"], None, user)
+            ok, output = await run_cli_async(["login", "poll-token", "--json"], None, user)
             data = _extract_json(output)
             payload = (data or {}).get("data") if isinstance(data, dict) else None
             payload = payload if isinstance(payload, dict) else {}

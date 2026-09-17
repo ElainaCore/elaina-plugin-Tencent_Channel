@@ -50,7 +50,7 @@ async def handle_token_setup(event, match):
         return
     token = parts[1].strip()
     _invalidate_self_user_cache(_fingerprint_token(token))
-    ok, output = await asyncio.to_thread(_run_cli, ["token", "setup", token])
+    ok, output = await run_cli_async( ["token", "setup", token])
     if not ok and _is_unknown_command(output):
         await event.reply(
             "当前版本 CLI 不支持手动配置 token，请使用「频道登录」扫码授权登录"

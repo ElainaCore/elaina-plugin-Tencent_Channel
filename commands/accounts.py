@@ -48,8 +48,7 @@ async def handle_user_status(event, match):
     if name not in list_users():
         await event.reply(f"槽位「{name}」不存在，发送「频道账号列表」查看")
         return
-    ok, output = await asyncio.to_thread(
-        _run_cli, ["login", "status", "--json"], None, name
+    ok, output = await run_cli_async( ["login", "status", "--json"], None, name
     )
     await event.reply(
         _render_result(

@@ -7,7 +7,7 @@ async def _reply_cli(
     event, args: List[str], title: str, guild_id: Optional[str] = None
 ):
     final_args = _with_preview(args)
-    ok, output = await asyncio.to_thread(_run_cli, final_args)
+    ok, output = await run_cli_async( final_args)
     await event.reply(
         _render_result(
             title, ok, _normalize_rate_limit(output), final_args, guild_id=guild_id
@@ -24,7 +24,7 @@ async def _reply_cli_json_stdin(
 ):
     final_args = _with_preview(args)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    ok, output = await asyncio.to_thread(_run_cli, final_args, body)
+    ok, output = await run_cli_async( final_args, body)
     await event.reply(
         _render_result(
             title, ok, _normalize_rate_limit(output), final_args, guild_id=guild_id

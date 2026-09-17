@@ -387,7 +387,7 @@ def run_schedule_sync(schedule: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def run_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
-    result = await asyncio.to_thread(run_schedule_sync, schedule)
+    result = await run_blocking(run_schedule_sync, schedule)
     schedules = load_schedules()
     for item in schedules:
         if item.get("id") == schedule.get("id"):

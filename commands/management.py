@@ -13,8 +13,7 @@ async def handle_guild_list(event, match):
             return
         expires_at = int(payload.get("expires_at") or 0)
         if expires_at and expires_at <= int(time.time()):
-            ok, output = await asyncio.to_thread(
-                _run_cli, ["manage", "get-my-join-guild-info", "--json"]
+            ok, output = await run_cli_async( ["manage", "get-my-join-guild-info", "--json"]
             )
             if ok:
                 data = _extract_json(output)
@@ -54,8 +53,7 @@ async def handle_guild_list(event, match):
             _render_result("频道列表", True, ok_output, [], guild_id=None)
         )
         return
-    ok, output = await asyncio.to_thread(
-        _run_cli, ["manage", "get-my-join-guild-info", "--json"]
+    ok, output = await run_cli_async( ["manage", "get-my-join-guild-info", "--json"]
     )
     if ok:
         data = _extract_json(output)
@@ -75,12 +73,10 @@ async def handle_guild_list(event, match):
 async def handle_guild_info(event, match):
     guild_id = _parts(event)[1]
     # 同时获取频道资料和分享链接
-    ok_info, output_info = await asyncio.to_thread(
-        _run_cli,
+    ok_info, output_info = await run_cli_async(
         _with_preview(["manage", "get-guild-info", "--guild-id", guild_id, "--json"]),
     )
-    ok_share, output_share = await asyncio.to_thread(
-        _run_cli,
+    ok_share, output_share = await run_cli_async(
         _with_preview(
             ["manage", "get-guild-share-url", "--guild-id", guild_id, "--json"]
         ),
