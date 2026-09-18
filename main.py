@@ -22,6 +22,6 @@ def _txpd_unload():
 __plugin_meta__ = {
     "name": "腾讯频道(新)",
     "description": "腾讯频道管理：指令控制，Web管理面板，定时发帖",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "author": "ElainaBot",
 }

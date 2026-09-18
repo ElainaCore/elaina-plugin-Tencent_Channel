@@ -1071,8 +1071,13 @@ async def api_run_schedule(request: web.Request):
     schedule = next((s for s in feed_scheduler.load_schedules() if s.get("id") == schedule_id), None)
     if not schedule:
         return web.json_response({"success": False, "message": "计划不存在"})
-    result = await feed_scheduler.run_schedule(schedule)
-    return web.json_response({"success": result["ok"], "message": result["message"]})
+    try:
+        result = await feed_scheduler.run_schedule(schedule)
+    except Exception as e:
+        # 执行链路（CLI 缺失 / 超时 / 槽位异常…）抛错时不能让面板回 500 的 HTML 错误页：
+        # 前端 res.json() 会解析失败，只看到 "Unexpected non-whitespace character after JSON at position 4"。
+        return web.json_response({"success": False, "message": "执行失败：%s: %s" % (type(e).__name__, e)})
+    return web.json_response({"success": bool(result.get("ok")), "message": result.get("message") or ""})
 
 
 @register_route("POST", "/api/ext/tencent-channel/schedules/delete")

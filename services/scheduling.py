@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from core.plugin.decorators import on_load, on_unload
 
 from ..commands.shared import DATA_DIR, _ensure_parent, _extract_json, _normalize_rate_limit, _run_cli
+from ..commands.runtime import run_blocking
 
 SCHEDULES_FILE = DATA_DIR / "feed_schedules.json"
 HISTORY_FILE = DATA_DIR / "post_history.json"
