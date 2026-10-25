@@ -1559,7 +1559,7 @@
         }
       }
     }
-    if (!g && _nativeGuild && String(_nativeGuild.guild_number) === num) g = _nativeGuild;
+    if (!g && _nativeGuild && (String(_nativeGuild.guild_number) === num || String(_nativeGuild.guild_id) === num || _nativeGuild.route_number === num)) g = _nativeGuild;
     return { num: num, g: g, id: g ? g.guild_id : '' };
   }
 
@@ -2818,6 +2818,9 @@
   }
 
   function guildMetaIdentity(num) {
+    if (_nativeGuild && _nativeGuild.read_source === 'web') {
+      return { role: '网页账号浏览（CLI 未加入）', gid: _nativeGuild.guild_id, known: true, web: true };
+    }
     if (_guildsCache && _guildsCache.length) {
       var want = numVariants(num);
       for (var i = 0; i < _guildsCache.length; i++) {
@@ -2835,10 +2838,6 @@
         }
       }
       // 并且顺手刷新一次频道列表（列表有 1 小时缓存，刚加入的频道可能还没进来）
-      var off = officialMemberKeys();
-      if ((num && off.gids[num]) || (pn && off.names[pn])) {
-        return { role: '已加入（网页账号）', gid: '', known: true };
-      }
       refreshJoinedSoon();
       return { role: '未加入', gid: '', known: true };
     }
@@ -2919,7 +2918,7 @@
     var num = currentGuildNumber();
     if (!num) return;
     var ident = guildMetaIdentity(num);
-    var joinTxt = _joinSettingCache[num] || '';
+    var joinTxt = ident.web ? '未知' : _joinSettingCache[num] || '';
     var row = hostBasic.querySelector('.txpd-guild-meta');
     if (!row) {
       row = el('div', { 'class': 'txpd-guild-meta', style: 'font-size:12px;color:#888;margin-top:4px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;' });
@@ -3936,10 +3935,10 @@
       more.setAttribute('data-loading', '1');
       var old = more.textContent;
       more.textContent = '加载中…';
-      api('/cli', { method: 'POST', body: { action: 'replies', params: {
+      nativeCommentRead('replies', {
         feed_id: ctx.feedId, comment_id: c.comment_id, guild_id: ctx.guildId, channel_id: ctx.channelId,
         count: '20', attach_info: c.attach_info || c.attachInfo || '',
-      } } }).then(function (rr) {
+      }, ctx).then(function (rr) {
         if (!rr.success) throw new Error(rr.message || '加载回复失败');
         var d = (rr.data && rr.data.data) || {};
         var items = d.replies || d.items || d.list || [];
@@ -4050,7 +4049,14 @@
     var hit = _feedDetailCache[feedId];
     if (hit && Date.now() - hit.ts < 60000) return Promise.resolve(hit.payload);
     if (_feedDetailInflight[feedId]) return _feedDetailInflight[feedId];
-    var pr = api('/cli', { method: 'POST', body: { action: 'feed-detail', params: { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' } } }).then(function (r) {
+    var webRead = !(_joinedKeys && _joinedKeys[guildId]) && (nativeGuildHints.has(String(guildId)) || (_nativeGuild && _nativeGuild.read_source === 'web'));
+    var request = webRead
+      ? nativeWebRead('feed', { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' }).then(function (data) {
+        if (data.feed) data.feed.read_source = 'web';
+        return { success: true, data: { data: data } };
+      })
+      : api('/cli', { method: 'POST', body: { action: 'feed-detail', params: { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' } } });
+    var pr = request.then(function (r) {
       delete _feedDetailInflight[feedId];
       if (r && r.success) _feedDetailCache[feedId] = { ts: Date.now(), payload: r };
       return r;
@@ -4086,6 +4092,7 @@
         channelId: feed.channel_id || channelId || '',
         feedAuthorId: feed.author_id || '',
         feedCreateTime: String(feed.create_time_raw || feed.create_time),
+        readSource: feed.read_source || 'cli',
       };
       wrap.innerHTML = '';
       // ── 官方详情结构：左图右文 + 官方评论区 + 官方底部条（样式全部来自官方 CSS）──────
@@ -4211,7 +4218,7 @@
         clist.innerHTML = '';
         clist.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '评论加载中…'));
         // 以前没传这个参数，前端也没画 reply_list，所以「评论的评论」根本显示不出来。
-        api('/cli', { method: 'POST', body: { action: 'comments', params: { feed_id: feedId, guild_id: ctx.guildId, channel_id: ctx.channelId, count: '20', reply_list_num: '10' } } }).then(function (rc) {
+        nativeCommentRead('comments', { feed_id: feedId, guild_id: ctx.guildId, channel_id: ctx.channelId, count: '20', reply_list_num: '10' }, ctx).then(function (rc) {
           var list = (rc.data && rc.data.data && rc.data.data.comments) || [];
           clist.innerHTML = '';
           if (!rc.success) { clist.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '评论加载失败：' + String(rc.message || '').slice(0, 60))); return; }
@@ -4980,6 +4987,31 @@
   var nativeCache = Object.create(null);
   var nativePending = Object.create(null);
   var _nativeGuild = null;
+  var nativeGuildHints = new Map();
+  try {
+    (JSON.parse(sessionStorage.getItem('txpd_web_guild_hints') || '[]')).forEach(function (guild) { rememberWebGuild(guild, false); });
+  } catch (error) { /* 缓存损坏不影响网页读取 */ }
+  function rememberWebGuild(guild, persist) {
+    if (!guild || !guild.guild_id) return;
+    var hint = { guild_id: String(guild.guild_id), guild_number: String(guild.guild_number || ''), name: guild.name || guild.guild_name || '', avatar_url: guild.avatar_url || '', cover_url: guild.cover_url || '' };
+    nativeGuildHints.set(hint.guild_id, hint);
+    if (hint.guild_number) nativeGuildHints.set(hint.guild_number, hint);
+    if (persist !== false) {
+      try { sessionStorage.setItem('txpd_web_guild_hints', JSON.stringify(Array.from(new Set(nativeGuildHints.values())).slice(-100))); } catch (error) {}
+    }
+  }
+  function nativeWebRead(endpoint, params) {
+    return api('/web/' + endpoint + '?' + new URLSearchParams(params || {}).toString()).then(function (result) {
+      if (!result.success) throw new Error(result.message || '网页登录态读取失败');
+      return result.data || {};
+    });
+  }
+  function nativeCommentRead(action, params, ctx) {
+    if (ctx.readSource === 'web') {
+      return nativeWebRead(action, params).then(function (data) { return { success: true, data: { data: data } }; });
+    }
+    return api('/cli', { method: 'POST', body: { action: action, params: params } });
+  }
 
   function nativeData(action, params) {
     var key = TXPD_USER + ':' + action + ':' + JSON.stringify(params || {});
@@ -5021,7 +5053,10 @@
       more.textContent = '加载中…';
       var query = Object.assign({}, params);
       if (cursor) query.feed_attach_info = cursor;
-      return nativeData(action, query).then(function (data) {
+      var request = guild && guild.read_source === 'web'
+        ? nativeWebRead('feeds', Object.assign({}, query, { guild_number: guild.guild_number || '' }))
+        : nativeData(action, query);
+      return request.then(function (data) {
         if (token !== nativeVersion || !host.isConnected) return;
         if (!cursor) list.replaceChildren();
         var feeds = data.feeds || [];
@@ -5054,13 +5089,14 @@
     load();
   }
   function nativeGuildId(num) {
-    return loadJoinedGuilds().then(function (guilds) {
+    var joined = _acctAny === false ? Promise.resolve([]) : loadJoinedGuilds().catch(function () { return []; });
+    return joined.then(function (guilds) {
       var guild = guilds.find(function (g) { return String(g.guild_number) === num || String(g.guild_id) === num; });
-      if (guild) return guild;
-      return nativeData('search-guild', { keyword: num }).then(function (data) {
-        var found = (data.channels || []).find(function (g) { return String(g.guild_number) === num || String(g.guild_id) === num; });
-        if (!found || !found.guild_id) throw new Error('未找到频道，请检查频道号或账号权限');
-        return found;
+      if (guild) return Object.assign({}, guild, { read_source: 'cli' });
+      var hint = nativeGuildHints.get(num) || {};
+      return nativeWebRead('guild', { guild_number: hint.guild_number || num, guild_id: hint.guild_id || '' }).then(function (data) {
+        rememberWebGuild(data);
+        return Object.assign({}, data, { read_source: 'web' });
       });
     });
   }
@@ -5078,6 +5114,7 @@
     Promise.all([nativeGuildId(num), guildTemplate()]).then(function (results) {
       if (token !== nativeVersion) return;
       var guild = results[0];
+      guild.route_number = num;
       _nativeGuild = guild;
       _gidByNumber[num] = guild.guild_id;
       if (subpath === 'post') {
@@ -5124,7 +5161,7 @@
         enforceImgPolicy(page);
       }
       showHeader({});
-      nativeData('guild-info', { guild_id: guild.guild_id }).then(showHeader).catch(function () {});
+      if (guild.read_source !== 'web') nativeData('guild-info', { guild_id: guild.guild_id }).then(showHeader).catch(function () {});
       var tabs = page.querySelector('.game-guild-main-tab-bar .swiper-wrapper');
       tabs.parentNode.style.overflowX = 'auto';
       var sort = new URLSearchParams((PANEL_STARTUP.route || '').split('?')[1] || '').get('sort') || 'hot';
@@ -5137,7 +5174,8 @@
         slide.appendChild(button); tabs.appendChild(slide);
       }
       tab('全部', '', 'all'); tab('热门', '', 'hot');
-      nativeData('channels', { guild_id: guild.guild_id }).then(function (data) {
+      var channelRequest = guild.read_source === 'web' ? Promise.resolve({ channels: guild.channels || [] }) : nativeData('channels', { guild_id: guild.guild_id });
+      channelRequest.then(function (data) {
         if (token !== nativeVersion) return;
         (data.channels || []).forEach(function (channel) { tab(channel.channel_name || channel.name || channel.channel_id, String(channel.channel_id), ''); });
       }).catch(function (error) { tabs.appendChild(el('span', { 'class': 'txpd-cli-empty' }, '版块加载失败：' + error.message)); });
@@ -5176,10 +5214,13 @@
       data.recommend_list.forEach(function (item) {
         if (item.content_recommend_guild) {
           var g = item.content_recommend_guild;
-          result.channels.push({ guild_id: g.guild_id, guild_number: g.guild_number, name: g.guild_name, avatar_url: g.guild_avatar, cover_url: g.cover, profile: g.guild_profile });
+          var guild = { guild_id: g.guild_id, guild_number: g.guild_number, name: g.guild_name, avatar_url: g.guild_avatar, cover_url: g.cover, profile: g.guild_profile };
+          rememberWebGuild(guild);
+          result.channels.push(guild);
           result.order.push('guild:' + g.guild_id);
         } else if (item.feed) {
           var f = item.feed, info = f.guild_info || {}, stats = f.feed_stat || {}, poster = f.poster || {};
+          rememberWebGuild({ guild_id: info.guild_id, guild_number: info.guild_number, name: info.guild_name, avatar_url: info.guild_icon });
           var text = (((f.rich_text || {}).contents) || []).map(function (part) { return part.text_content ? part.text_content.text || '' : ''; }).join('');
           result.feeds.push({ feed_id: f.id, guild_id: info.guild_id, guild_number: info.guild_number, guild_name: info.guild_name, guild_avatar: info.guild_icon, channel_id: info.channel_id, author: poster.nick || '', author_id: poster.tiny_id || '', title: f.title || '', content_snippet: text, create_time_raw: f.create_time, feed_type: f.feed_type, prefer_count: stats.prefer_count || 0, comment_count: stats.total_comment_count || 0, images: ((f.image || {}).thumb_images || []).map(function (image) { return image.url; }) });
           if (info.guild_icon) _dyn.icons[info.guild_id] = info.guild_icon;
@@ -5236,6 +5277,7 @@
         if (data.fallback) cards.appendChild(el('div', { 'class': 'txpd-cli-empty', style: 'grid-column:1/-1;' }, '推荐暂不可用，以下是已加入频道的热门内容'));
         var guilds = data.channels || [];
         guilds.forEach(function (guild) {
+          rememberWebGuild(guild);
           if (seen['guild:' + guild.guild_id]) return;
           seen['guild:' + guild.guild_id] = true;
           var num = guild.guild_number || guild.guild_id;

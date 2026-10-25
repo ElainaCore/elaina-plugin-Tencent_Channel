@@ -19,6 +19,7 @@ from aiohttp import web
 
 from core.plugin.decorators import on_load, on_unload
 from core.plugin.web_pages import register_page, register_route, unregister_page
+from .reader import WebReader, WebReadError
 
 from ..services import scheduling as feed_scheduler
 from ..services.notifications import (
@@ -875,6 +876,78 @@ async def _json_body(request: web.Request) -> Dict[str, Any]:
 
 
 # ==================== 路由 ====================
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/guild")
+async def api_web_guild(request: web.Request):
+    number = str(request.query.get("guild_number") or "").strip()
+    guild_id = str(request.query.get("guild_id") or "").strip()
+    if not number and not guild_id:
+        return web.json_response({"success": False, "message": "缺少频道号或频道 ID"})
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.guild(number, guild_id)
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    _remember_ids(str(data["guild_number"]), str(data["guild_id"]))
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/feeds")
+async def api_web_feeds(request: web.Request):
+    guild_id = str(request.query.get("guild_id") or "").strip()
+    if not guild_id:
+        return web.json_response({"success": False, "message": "缺少频道 ID"})
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.feeds(guild_id, str(request.query.get("guild_number") or ""),
+                                  str(request.query.get("channel_id") or ""),
+                                  str(request.query.get("feed_attach_info") or ""),
+                                  str(request.query.get("get_type") or "1"))
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/feed")
+async def api_web_feed(request: web.Request):
+    guild_id = str(request.query.get("guild_id") or "").strip()
+    feed_id = str(request.query.get("feed_id") or "").strip()
+    if not guild_id or not feed_id:
+        return web.json_response({"success": False, "message": "缺少帖子 ID 或频道 ID"})
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.feed(feed_id, guild_id, str(request.query.get("channel_id") or ""))
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/comments")
+async def api_web_comments(request: web.Request):
+    guild_id = str(request.query.get("guild_id") or "").strip()
+    feed_id = str(request.query.get("feed_id") or "").strip()
+    channel = str(request.query.get("channel_id") or "")
+    cursor = str(request.query.get("attach_info") or "")
+    if not guild_id or not feed_id:
+        return web.json_response({"success": False, "message": "缺少帖子 ID 或频道 ID"})
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        if request.path.endswith("/replies"):
+            comment_id = str(request.query.get("comment_id") or "").strip()
+            if not comment_id:
+                return web.json_response({"success": False, "message": "缺少评论 ID"})
+            data = await reader.replies(feed_id, guild_id, channel, comment_id, cursor)
+        else:
+            data = await reader.comments(feed_id, guild_id, channel, cursor)
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/replies")
+async def api_web_replies(request: web.Request):
+    return await api_web_comments(request)
 
 
 @register_route("POST", "/api/ext/tencent-channel/cli")
