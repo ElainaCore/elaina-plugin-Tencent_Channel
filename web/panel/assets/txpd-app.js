@@ -2,10 +2,7 @@
   'use strict';
 
   var TXPD_API = '/api/ext/tencent-channel';
-  var PROXY_PREFIX = TXPD_API + '/pd/';
   var PANEL_BASE = TXPD_API + '/panel/';
-  // 命中 qq 域的浏览器请求一律改写成本地 404，不触达 qq.com
-  var BLOCKED_PATH = TXPD_API + '/__blocked';
 
   // 首屏状态与路由在本地入口启动前就已确定；适配层不再与路由器抢入口。
   var PANEL_STARTUP = window.TXPD_PANEL || {};
@@ -16,256 +13,17 @@
     return String(p).replace(/^\/+/, '').replace(/\/+$/, '');
   }
 
-  // 都会连打这几条 console.error 刷屏。这里只压这几条已知噪音，其它报错照常输出。
-  (function () {
-    var pats = ['[turingSdk]', 'turingSDK', 'initTuringSdk', 'deviceToken2SignToken', 'activate sign token'];
-    ['error', 'warn'].forEach(function (level) {
-      var orig = console[level];
-      if (typeof orig !== 'function') return;
-      console[level] = function () {
-        try {
-          var first = String(arguments.length ? arguments[0] : '');
-          for (var i = 0; i < pats.length; i++) {
-            if (first.indexOf(pats[i]) !== -1) return;
-          }
-        } catch (e) { /* 判断失败就照常输出 */ }
-        return orig.apply(console, arguments);
-      };
-    });
-  })();
-
-  //    合并进 getter；真实数据鉴权仍由代理在服务端完成。
-  var VIRTUAL_COOKIES = {};
-  var TXPD_USER = '';
-  var TXPD_WEB_LOGGED_IN = false;   // 网页登录态（只影响显示），由下面的 /panel-cookie 赋值
-  var _cliLoggedIn = null;          // CLI 账号登录态快照：null = 还没查过
-  // CLI 账号完成（不随网页登录态切换账号），所以这里没有「CLI 模式」开关了。
-  try {
-    var _origCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
-    if (_origCookie && _origCookie.get && _origCookie.set) {
-      Object.defineProperty(document, 'cookie', {
-        get: function () {
-          var raw = _origCookie.get.call(this) || '';
-          var real = raw.split(/;\s*/).filter(function (p) {
-            var i = p.indexOf('=');
-            if (i <= 0) return false;
-            var v = p.slice(i + 1);
-            return v !== 'undefined' && v !== 'null' && v !== '';
-          });
-          var virtual = Object.keys(VIRTUAL_COOKIES).filter(function (k) {
-            // 与真实 Cookie 同口径：丢掉空值 / undefined / null（槽位 Cookie 文件里的残留值）
-            var v = String(VIRTUAL_COOKIES[k]).trim();
-            return k && v !== '' && v !== 'undefined' && v !== 'null';
-          }).map(function (k) {
-            // 值里出现 ; 或换行会把一个 cookie 拆成两段，解析器碰到空段就 trim 报错
-            return k + '=' + String(VIRTUAL_COOKIES[k]).replace(/[;\r\n]+/g, '');
-          });
-          var out = virtual.concat(real).join('; ');
-          // （实测 static-res.qq.com 的统计脚本就是这样崩的），空串还会让解析结果全是脏键。
-          return out || 'txpd_noop=1';
-        },
-        set: function (v) { _origCookie.set.call(this, v); },
-        configurable: true,
-      });
-    }
-  } catch (e) { /* 忽略，不影响主流程 */ }
-
-  // 启动器异步预取完成后才加载此脚本，不再使用阻塞主线程的同步 XHR。
-  (function loadVirtualCookies() {
-    var session = PANEL_STARTUP.session || {};
-    var cookies = session.cookies || {};
-    Object.keys(cookies).forEach(function (key) { VIRTUAL_COOKIES[key] = cookies[key]; });
-    TXPD_USER = session.user || '';
-    TXPD_WEB_LOGGED_IN = !!session.session_valid;
-    _cliLoggedIn = !!PANEL_STARTUP.anyAccount;
-  })();
-
-  // ---------- qq 域封锁：浏览器侧禁止任何到 *.qq.com 的请求 ----------
-  function isQqUrl(u) {
-    if (typeof u !== 'string') return false;
-    var m = /^(https?|wss?):\/\/([^\/?#]+)/i.exec(u);
-    if (!m) return false;
-    var host = m[2].split(':')[0].toLowerCase();
-    return host === 'qq.com' || (host.length > 7 && host.slice(-7) === '.qq.com');
-  }
-
-  // 若让它 reject，页面上会多出 Uncaught (in promise)。
-  function blockSrcProp(el) {
-    var proto = el.tagName === 'IFRAME' ? HTMLIFrameElement.prototype : HTMLScriptElement.prototype;
-    var desc = Object.getOwnPropertyDescriptor(proto, 'src');
-    if (!desc || !desc.get || !desc.set) return;
-    try {
-      Object.defineProperty(el, 'src', {
-        configurable: true,
-        enumerable: true,
-        get: function () { return desc.get.call(this); },
-        set: function (v) {
-          // 直接把地址吞掉：元素照旧可插入，但不会发起任何请求，也不会执行远端代码
-          if (isQqUrl(v)) { this.setAttribute('data-txpd-blocked', String(v)); return; }
-          desc.set.call(this, v);
-        },
-      });
-    } catch (e) { /* 个别环境无法重定义则退回 MutationObserver */ }
-  }
-  try {
-    var _createElement = document.createElement;
-    document.createElement = function (tag) {
-      var el = _createElement.apply(document, arguments);
-      try {
-        if (el && (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME')) blockSrcProp(el);
-      } catch (e) { /* 忽略 */ }
-      return el;
-    };
-    var _setAttribute = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function (name, value) {
-      try {
-        if (String(name).toLowerCase() === 'src' && isQqUrl(value) && (this.tagName === 'SCRIPT' || this.tagName === 'IFRAME')) {
-          _setAttribute.call(this, 'data-txpd-blocked', String(value));
-          return;
-        }
-      } catch (e) { /* 忽略 */ }
-      return _setAttribute.call(this, name, value);
-    };
-  } catch (e) { /* 封锁失败不阻断主流程 */ }
-
-  // 点击走本应用自己的路由（帖子详情/频道视图），不再跳去真实站点，也不算 qq 域请求
+  var TXPD_USER = (PANEL_STARTUP.session || {}).user || '';
+  function isQqUrl(u) { return /^(?:https?:)?\/\/(?:[^/]+\.)?qq\.com(?:[/:]|$)/i.test(String(u || '')); }
   function normalizeQqAnchor(a) {
     var href = a.getAttribute && a.getAttribute('href');
-    if (!href || typeof href !== 'string') return;
-    var m = /^(?:https?:)?\/\/pd\.qq\.com(\/[^#]*)?(#.*)?$/i.exec(href);
-    if (m) a.setAttribute('href', (m[1] || '/') + (m[2] || ''));
+    var match = /^(?:https?:)?\/\/pd\.qq\.com(\/.*)?$/i.exec(href || '');
+    if (match) a.setAttribute('href', PANEL_BASE + (match[1] || '/explore').replace(/^\/+/, ''));
   }
-
-  // 「未加入的频道」分组的即时清理（MutationObserver 触发，插入瞬间隐藏避免闪烁）
-  function hideTempNodes(node) {
-    if (!_joinedKeys && !_joinedNames || !node || node.nodeType !== 1 || !node.closest) return;
-    if (!node.closest('.aside-group--my-temp-guild')) return;
-    if (node.classList && node.classList.contains('my-guild-item')) {
-      tempHideItem(node);
-    }
-    var sub = node.querySelectorAll ? node.querySelectorAll('.my-guild-item') : [];
-    for (var i = 0; i < sub.length; i++) tempHideItem(sub[i]);
+  function enforceImgPolicy(node) {
+    if (!node || !node.querySelectorAll) return;
+    Array.prototype.forEach.call(node.querySelectorAll('img'), function (img) { img.referrerPolicy = 'no-referrer'; });
   }
-
-  // 所有图片强制 referrerpolicy=no-referrer（meta 可能被应用显式策略绕过；图片 CDN 有防盗链）
-  function enforceImgPolicy(n) {
-    if (!n || n.nodeType !== 1) return;
-    var imgs = n.tagName === 'IMG' ? [n] : (n.querySelectorAll ? n.querySelectorAll('img') : []);
-    for (var i = 0; i < imgs.length; i++) {
-      if (imgs[i].getAttribute('referrerpolicy') !== 'no-referrer') imgs[i].setAttribute('referrerpolicy', 'no-referrer');
-    }
-  }
-  // 动态插入的 iframe/script（ptlogin 登录 iframe、统计脚本等）→ 移除；qq 域图片保留（只去 referer）
-  function purgeQqNode(n) {
-    if (n.nodeType !== 1) return;
-    var tag = n.tagName;
-    if (tag === 'A') { normalizeQqAnchor(n); enforceImgPolicy(n); return; }
-    if ((tag === 'IFRAME' || tag === 'SCRIPT') && isQqUrl(n.getAttribute && n.getAttribute('src'))) {
-      if (n.parentNode) n.parentNode.removeChild(n);
-      return;
-    }
-    if (tag === 'IMG') { enforceImgPolicy(n); return; }
-    if (n.querySelectorAll) {
-      var sub = n.querySelectorAll('iframe[src], script[src], img, a[href]');
-      for (var i = 0; i < sub.length; i++) {
-        var s = sub[i];
-        if (s.tagName === 'A') normalizeQqAnchor(s);
-        else if (s.tagName === 'IMG') enforceImgPolicy(s);
-        else if (isQqUrl(s.getAttribute('src')) && s.parentNode) s.parentNode.removeChild(s);
-      }
-    }
-  }
-  try {
-    var _mo = new MutationObserver(function (muts) {
-      for (var i = 0; i < muts.length; i++) {
-        var m = muts[i];
-        if (m.type === 'attributes') {
-          purgeQqNode(m.target);
-          if (m.attributeName === 'class') hideTempNodes(m.target);
-          continue;
-        }
-        var added = m.addedNodes;
-        for (var j = 0; j < added.length; j++) {
-          purgeQqNode(added[j]);
-          hideTempNodes(added[j]);
-        }
-        if (!_uiSyncQueued) queueUiSync();
-      }
-    });
-    _mo.observe(document.documentElement || document, {
-      childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'class'],
-    });
-  } catch (e) { /* 封锁失败不阻断主流程 */ }
-
-  // ---------- 网络重定向：本站 API → pd.qq.com 代理；qq 域 → 本地拦截 ----------
-  var PATH_PREFIXES = ['/qunng/', '/cgi-bin/', '/webconn/', '/trpc.'];
-  function needRewrite(u) {
-    if (typeof u !== 'string') return false;
-    if (u.indexOf(PROXY_PREFIX) === 0 || u.indexOf(TXPD_API + '/') === 0) return false;
-    if (isQqUrl(u)) return false; // qq 域走拦截，不走代理
-    if (/^https?:\/\//i.test(u)) return false;
-    for (var i = 0; i < PATH_PREFIXES.length; i++) {
-      if (u.indexOf(PATH_PREFIXES[i]) === 0 || u.indexOf('&' + PATH_PREFIXES[i]) > 0) return true;
-    }
-    return false;
-  }
-  function toProxy(u) {
-    // 相对路径（/qunng/...）→ /api/ext/tencent-channel/pd/qunng/...
-    if (u.indexOf('&') > 0 && u.indexOf('/trpc') > 0 && u.charAt(0) !== '/') {
-      // mobile 形态: "<finalPath>?<query>&origin_url=..." 整体作为 tail
-      return PROXY_PREFIX + u;
-    }
-    return PROXY_PREFIX + u.replace(/^\//, '');
-  }
-
-  var _origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    try {
-      if (isQqUrl(typeof input === 'string' ? input : input && input.url)) {
-        input = BLOCKED_PATH; // 本地 404，不触达 qq.com
-      } else if (typeof input === 'string' && needRewrite(input)) {
-        input = toProxy(input);
-      } else if (input && typeof input.url === 'string' && needRewrite(input.url)) {
-        input = new Request(toProxy(input.url), input);
-      }
-    } catch (e) { /* 保持原请求 */ }
-    return _origFetch.call(window, input, init);
-  };
-
-  var _origOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url) {
-    try {
-      if (isQqUrl(url)) {
-        url = BLOCKED_PATH;
-      } else if (needRewrite(url)) {
-        url = toProxy(url);
-      }
-    } catch (e) { /* 保持原请求 */ }
-    return _origOpen.apply(this, [method, url].concat([].slice.call(arguments, 2)));
-  };
-
-  // 上报类通道一并封口
-  try {
-    var _origBeacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
-    if (_origBeacon) {
-      navigator.sendBeacon = function (url, data) {
-        if (isQqUrl(url)) return true;
-        return _origBeacon(url, data);
-      };
-    }
-    var _WS = window.WebSocket;
-    if (_WS) {
-      window.WebSocket = function (url, protocols) {
-        if (isQqUrl(url)) throw new TypeError('txpd: qq domain blocked');
-        return protocols === undefined ? new _WS(url) : new _WS(url, protocols);
-      };
-      window.WebSocket.prototype = _WS.prototype;
-      window.WebSocket.OPEN = _WS.OPEN;
-      window.WebSocket.CONNECTING = _WS.CONNECTING;
-      window.WebSocket.CLOSING = _WS.CLOSING;
-      window.WebSocket.CLOSED = _WS.CLOSED;
-    }
-  } catch (e) { /* 忽略 */ }
 
   // 这里在同一个捕获层先处理：自己滚 + 阻止应用那层再拦。必须早注册（脚本先于应用 bundle 执行）。
   (function () {
@@ -314,11 +72,17 @@
   // ---------- 账号弹窗（插件自己的扫码登录，不经 qq 域） ----------
   function api(path, opts) {
     opts = opts || {};
+    var controller = opts.timeout ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, opts.timeout) : null;
     return fetch(TXPD_API + path, {
       method: opts.method || 'GET',
-      headers: { 'Content-Type': 'application/json' },
+      headers: Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}),
       body: opts.body ? JSON.stringify(opts.body) : undefined,
-    }).then(function (r) { return r.json(); });
+      signal: controller ? controller.signal : undefined,
+    }).then(function (r) {
+      if (!r.ok) throw new Error('请求失败（HTTP ' + r.status + '）');
+      return r.json();
+    }).finally(function () { if (timer) clearTimeout(timer); });
   }
 
   function el(tag, attrs, text) {
@@ -773,34 +537,33 @@
   document.head.appendChild(style);
 
   // ---------- 账号状态（缓存 10s）：决定登录按钮的形态 ----------
-  var _acctAny = !!PANEL_STARTUP.anyAccount, _acctTs = Date.now();
-  setAcctState(_acctAny);
-  // 那里先声明再赋值，避免 var 初始化顺序把 loadVirtualCookies 写入的值覆盖回 false
+  var _acctAny = PANEL_STARTUP.anyAccount, _acctTs = 0, _acctPending = null;
   function acctCacheKey() { return 'txpd_acct_state_v1_' + (TXPD_USER || 'default'); }
   function setAcctState(any) {
     _acctAny = any; _acctTs = Date.now();
-    try { window.localStorage.setItem(acctCacheKey(), JSON.stringify({ ts: _acctTs, any: any })); } catch (e) { /* 忽略 */ }
+    document.body.classList.toggle('txpd-logged-in', any);
+    try {
+      localStorage.setItem(acctCacheKey(), JSON.stringify({ ts: _acctTs, any: any }));
+      localStorage.setItem('txpd_panel_account', JSON.stringify({ user: TXPD_USER, any: any }));
+    } catch (e) {}
+    var entry = document.getElementById('txpd-acct-entry');
+    if (entry) entry.textContent = any ? '切换账号' : '扫码登录';
   }
   function getAccountsState() {
-    var now = Date.now();
-    if (_acctAny !== null && now - _acctTs < 10000) return Promise.resolve(_acctAny);
-    // 3 小时本地缓存：页面打开瞬间先套用上次的登录态（UI 立即到位），随后接口确认
-    if (_acctAny === null) {
-      try {
-        var raw = window.localStorage.getItem(acctCacheKey());
-        if (raw) {
-          var box = JSON.parse(raw);
-          if (box && Date.now() - box.ts < 10800000) { _acctAny = !!box.any; _acctTs = box.ts; }
-        }
-      } catch (e) { /* 忽略 */ }
-    }
-    if (_acctAny !== null && now - _acctTs < 10000) return Promise.resolve(_acctAny);
-    return api('/accounts').then(function (r) {
-      var accs = (r.data && r.data.accounts) || [];
-      setAcctState(accs.some(function (a) { return a.logged_in; }));
-      _cliLoggedIn = _acctAny;   // 未登录时页面要显示「CLI 未登录，无法查看」
+    if (_acctTs && Date.now() - _acctTs < 10000) return Promise.resolve(_acctAny);
+    if (_acctPending) return _acctPending;
+    _acctPending = api('/accounts').then(function (r) {
+      if (!r.success) throw new Error(r.message || '账号状态加载失败');
+      var data = r.data || {};
+      PANEL_STARTUP.accounts = data.accounts || [];
+      if (data.current !== undefined && data.current !== TXPD_USER) {
+        TXPD_USER = data.current || '';
+        invalidateGuilds();
+      }
+      setAcctState((data.accounts || []).some(function (a) { return a.logged_in; }));
       return _acctAny;
-    });
+    }).finally(function () { _acctPending = null; });
+    return _acctPending;
   }
   function invalidateAccounts() {
     _acctAny = null; _acctTs = 0;
@@ -815,59 +578,13 @@
     try { window.localStorage.removeItem(guildCacheKey()); } catch (e) { /* 忽略 */ }
   }
 
-  function findVisibleButton(text) {
-    var all = document.querySelectorAll('button');
-    for (var i = 0; i < all.length; i++) {
-      var b = all[i];
-      if (b.closest && b.closest('#txpd-acct-mask')) continue;
-      if (b.textContent && b.textContent.trim() === text && b.offsetParent !== null) return b;
-    }
-    return null;
+  function refreshAccountUi() {
+    return getAccountsState().then(function () {
+      return loadJoinedGuilds();
+    }).then(function () {
+      renderJoinedList(); refreshJoinedAvatars(); syncPanelUi();
+    }).catch(function () { renderJoinedList(); });
   }
-
-  //   2) 已加入频道的视图不应再显示「加入频道」按钮
-  setInterval(function () {
-    getAccountsState().then(function (any) {
-      if (!document.body) return;   // 解析早期（还没到 body）：这轮跳过，3 秒后重来
-      if (any) {
-        var b = findVisibleButton('登录');
-        if (b) b.textContent = '切换账号';
-      } else {
-        var b2 = findVisibleButton('切换账号');
-        if (b2) b2.textContent = '登录';
-      }
-      var entry = document.getElementById('txpd-acct-entry');
-      if (entry) entry.textContent = any ? '切换账号' : '扫码登录';
-      // 有已登录账号 → 隐藏官方登录卡
-      if (any) document.body.classList.add('txpd-logged-in');
-      else document.body.classList.remove('txpd-logged-in');
-      ensureMobileBackButton();
-      ensureNarrowDrawer();
-      loadJoinedGuilds().then(function () {
-        syncTempGuildSection();
-        syncMyGuildDuplicates();
-        syncGuildViewJoinBtn();
-        moveChannelList();
-        ensureTopbarButtons();
-        ensureNavEntries();
-        syncPublishArea();
-        refreshJoinedAvatars();   // 官方「我的频道」晚一步渲染：定期回来把头补齐
-        syncAsideTitles();        // 分区标题：网页账号 / CLI 账号写清楚（会被应用重渲染还原）
-        syncLikedMarks();
-        ensureGuildMeta();
-      ensureGuildHeaderFallback();
-        ensureGuildHeaderFallback();
-      }).catch(function () { /* 拉取失败：下面照样重画，让分区显示失败态并继续自动重试 */ })
-        .then(function () { renderJoinedList(); });
-    }).catch(function () { /* 忽略 */ });
-    // 记录当前深层路径，宿主页面刷新后恢复位置
-    try {
-      var p = window.location.pathname + window.location.search;
-      if (!TXPD_EMBED && p.indexOf(PANEL_BASE) === 0) window.sessionStorage.setItem('txpd_last_path', p.slice(PANEL_BASE.length) || 'explore');
-    } catch (e) { /* 忽略 */ }
-    ensureJoinedSection();
-  }, 3000);
-
   // ---------- 官方「互动消息/通知」风格浮层：贴图标弹出的小面板（替代居中弹窗） ----------
   var _popEl = null, _popAnchor = null, _popOutside = null;
   function positionPopover() {
@@ -943,211 +660,6 @@
   }
 
   // ---------- 右侧抽屉（私信 / 插件管理员等，替代居中弹窗） ----------
-  function openDrawer(title) {
-    var dr = document.getElementById('txpd-drawer');
-    if (!dr) {
-      dr = el('div', { id: 'txpd-drawer' });
-      var head = el('div', { id: 'txpd-drawer-head' });
-      var tEl = el('div', { style: 'font-size:16px;font-weight:600;color:#111;' }, title);
-      var close = el('button', { style: 'border:none;background:none;font-size:20px;color:#666;cursor:pointer;line-height:1;' }, '×');
-      close.addEventListener('click', function () { dr.style.display = 'none'; });
-      head.appendChild(tEl);
-      head.appendChild(close);
-      var body = el('div', { id: 'txpd-drawer-body' });
-      dr.appendChild(head);
-      dr.appendChild(body);
-      document.body.appendChild(dr);
-      dr._title = tEl;
-      dr._body = body;
-    }
-    dr.style.display = 'flex';
-    dr._title.textContent = title;
-    dr._body.innerHTML = '';
-    return dr._body;
-  }
-
-  // 「已加入的频道」里对应频道名下，未加入分组只留真正的临时条目 ----------
-  var _movedChannelList = null;
-  var _movedChannelHome = null;   // 官方会话列表原来的父节点（收起时放回去，不删）
-
-  // 直接 remove 会让 Vue 之后 insertBefore 找不到参照节点（报 is not a child of this node）。
-  function restoreChannelList() {
-    var node = _movedChannelList;
-    _movedChannelList = null;
-    if (!node || !node.parentNode) return;
-    node.removeAttribute('data-txpd-moved');
-    node.style.cssText = '';
-    // 之前隐藏的官方「展开全部」也恢复（它只在列表被移走时才需要藏）
-    Array.prototype.forEach.call(node.querySelectorAll('[data-txpd-hidden]'), function (ch) {
-      ch.style.removeProperty('display');
-      ch.removeAttribute('data-txpd-hidden');
-    });
-    if (_movedChannelHome && _movedChannelHome.isConnected) {
-      _movedChannelHome.appendChild(node);
-    } else {
-      node.parentNode.removeChild(node);   // 原位置已经没了（换过频道/被应用重建）→ 只能移除
-    }
-    _movedChannelHome = null;
-  }
-
-  function moveChannelList() {
-    var num = currentGuildNumber();
-    var dst = num ? document.querySelector('.aside-group--txpd-joined .my-guild-item[data-gnum="' + num + '"]') : null;
-    // 非频道视图，或当前频道未加入（不在我的分区）→ 收起已移入的会话列表
-    if (!dst) {
-      restoreChannelList();
-      return;
-    }
-    var src = document.querySelector('.aside-group--my-temp-guild .channel-list');
-    if (!src || src.getAttribute('data-txpd-moved') === '1') return;
-    restoreChannelList();
-    _movedChannelHome = src.parentNode;
-    src.setAttribute('data-txpd-moved', '1');
-    src.style.cssText = 'padding:0 0 6px 6px;';
-    src.classList.remove('txpd-show-all');
-    // 用 inline !important 才能压过官方的展开态样式（普通 display:none 会被重新显示出来）
-    Array.prototype.forEach.call(src.children, function (ch) {
-      if ((ch.innerText || '').indexOf('展开全部') !== -1) {
-        ch.style.setProperty('display', 'none', 'important');
-        ch.setAttribute('data-txpd-hidden', '1');
-      }
-    });
-    dst.parentNode.insertBefore(src, dst.nextSibling);
-    _movedChannelList = src;
-    // 「查看全部/收起」切换行（会话数 > 3 时才有意义）
-    var convCount = src.children.length - src.querySelectorAll('.txpd-expand-link').length;
-    var toggle = document.getElementById('txpd-chlist-toggle');
-    if (!toggle) {
-      toggle = el('div', { id: 'txpd-chlist-toggle' });
-      toggle.style.cssText = 'font-size:12px;color:#2b64f5;padding:4px 6px;cursor:pointer;';
-      toggle.addEventListener('click', function () {
-        var list = document.querySelector('.channel-list[data-txpd-moved="1"]');
-        if (!list) return;
-        var showAll = list.classList.toggle('txpd-show-all');
-        toggle.textContent = showAll ? '收起' : '查看全部';
-      });
-    }
-    if (convCount > 3) {
-      toggle.textContent = src.classList.contains('txpd-show-all') ? '收起' : '查看全部';
-      toggle.style.display = 'block';
-      src.parentNode.insertBefore(toggle, src.nextSibling);
-    } else if (toggle.parentNode) {
-      toggle.style.display = 'none';
-    }
-  }
-
-  // 这里把官方我的频道里的频道也算作「已加入」，只用于从「未加入的频道」里剔除。
-  var _officialMyKeys = { ts: 0, gids: {}, names: {} };
-  function officialMemberKeys() {
-    var now = Date.now();
-    if (now - _officialMyKeys.ts < 500) return _officialMyKeys;
-    var gids = {}, names = {};
-    var group = document.querySelector('.aside-group--my-guild');
-    if (group) {
-      Array.prototype.forEach.call(group.querySelectorAll('.my-guild-item'), function (it) {
-        var img = it.querySelector('img.item-avatar') || it.querySelector('img');
-        var m = img ? /groupprohead\.gtimg\.cn\/(\d+)/.exec(img.getAttribute('src') || '') : null;
-        if (m) gids[m[1]] = 1;
-        var nameEl = it.querySelector('.item-name');
-        var t = nameEl ? (nameEl.textContent || '').trim() : '';
-        if (t) names[t] = 1;
-      });
-    }
-    _officialMyKeys = { ts: now, gids: gids, names: names };
-    return _officialMyKeys;
-  }
-
-  //    未加入的频道访问后要正常显示在「未加入的频道」里（官方行为，用户要求保留）
-  function tempHideItem(item) {
-    var img = item.querySelector('img.item-avatar');
-    var m = img ? /groupprohead\.gtimg\.cn\/(\d+)/.exec(img.getAttribute('src') || '') : null;
-    var gid = m ? m[1] : '';
-    var nameEl = item.querySelector('.item-name');
-    var name = nameEl ? nameEl.textContent.trim() : '';
-    if (!item.getAttribute('data-txpd-gnum') && name) item.setAttribute('data-txpd-gnum', name);
-    var cls = (item.className || '').toString();
-    var expanded = cls.indexOf('router-link-active') !== -1 || !!item.querySelector('.router-link-active') || (item.innerText || '').indexOf('展开全部') !== -1;
-    var num = currentGuildNumber();
-    var currentIsJoined = !!(num && _joinedKeys && _joinedKeys[num]);
-    var off = officialMemberKeys();
-    var officialJoined = !!((gid && off.gids[gid]) || (name && off.names[name]));
-    var numHit = numVariants(item.getAttribute('data-txpd-gnum') || gid).some(function (k) { return _joinedKeys && _joinedKeys[k]; });
-    if (officialJoined || numHit || (gid && _joinedKeys && _joinedKeys[gid]) || (name && _joinedNames && _joinedNames[name]) || (expanded && currentIsJoined)) {
-      item.style.display = 'none';
-      return true;
-    }
-    return false;
-  }
-  // 只改 display，不删不动官方节点（Vue 托管）。
-  function syncMyGuildDuplicates() {
-    var group = document.querySelector('.aside-group--my-guild');
-    if (!group) return;
-    Array.prototype.forEach.call(group.querySelectorAll('.my-guild-item'), function (it) {
-      var img = it.querySelector('img.item-avatar') || it.querySelector('img');
-      var m = img ? /groupprohead\.gtimg\.cn\/(\d+)/.exec(img.getAttribute('src') || '') : null;
-      var gid = m ? m[1] : '';
-      var nameEl = it.querySelector('.item-name');
-      var name = nameEl ? (nameEl.textContent || '').trim() : '';
-      var dup = !!((gid && _joinedKeys && _joinedKeys[gid])
-        || (name && _joinedNames && _joinedNames[name])
-        || numVariants(gid || name).some(function (k) { return _joinedKeys && _joinedKeys[k]; }));
-      if (dup) {
-        it.style.display = 'none';
-        it.setAttribute('data-txpd-dup', '1');
-      } else if (it.getAttribute('data-txpd-dup')) {
-        it.style.removeProperty('display');
-        it.removeAttribute('data-txpd-dup');
-      }
-    });
-  }
-
-  function syncTempGuildSection() {
-    if (!_joinedKeys) return;
-    var group = document.querySelector('.aside-group--my-temp-guild');
-    if (!group) return;
-    var items = group.querySelectorAll('.my-guild-item');
-    for (var i = 0; i < items.length; i++) tempHideItem(items[i]);
-    try {
-      var off = officialMemberKeys();
-      var lsKeys = [];
-      for (var k = 0; k < window.localStorage.length; k++) lsKeys.push(window.localStorage.key(k));
-      for (var j = 0; j < lsKeys.length; j++) {
-        var key = lsKeys[j];
-        if (key.indexOf('tempGuild_') !== 0) continue;
-        var raw = window.localStorage.getItem(key);
-        if (!raw || raw.indexOf('guildId') === -1) continue;
-        var arr = JSON.parse(raw);
-        if (!Array.isArray(arr)) continue;
-        // 丢掉：CLI 账号已加入的 / 官方「我的频道」里的 / 条目自己标了 hasJoined 的
-        var filtered = arr.filter(function (x) {
-          if (!x) return false;
-          if (_joinedKeys[x.guildNum] || _joinedKeys[x.guildId]) return false;
-          if (off.gids[x.guildId] || (x.guildName && off.names[x.guildName])) return false;
-          return !x.hasJoined;
-        });
-        if (filtered.length !== arr.length) window.localStorage.setItem(key, JSON.stringify(filtered));
-      }
-    } catch (e) { /* 存储不可用时忽略 */ }
-  }
-
-  // 已加入频道的视图：把「加入频道」按钮（button 或 join-guild-button DIV）替换为「已加入」
-  function syncGuildViewJoinBtn() {
-    if (!_joinedKeys) return;
-    var num = currentGuildNumber();
-    if (!num || !_joinedKeys[num]) return;
-    var els = document.querySelectorAll('button, .join-guild-button');
-    for (var i = 0; i < els.length; i++) {
-      var b = els[i];
-      if (b.textContent && b.textContent.trim() === '加入频道' && b.offsetParent !== null) {
-        b.disabled = true;
-        b.style.pointerEvents = 'none';
-        b.style.opacity = '0.6';
-        b.textContent = '✓ 已加入';
-      }
-    }
-  }
-
-  // ---------- 轻提示 ----------
   var toastEl = null;
   function toast(msg) {
     if (!toastEl) {
@@ -1950,24 +1462,6 @@
   };
 
   // 官方标题是 Vue 托管的文本节点：只改文本、不删节点；应用重渲染会还原，所以每轮同步补一次。
-  function syncAsideTitles() {
-    var groups = ['.aside-group--my-guild', '.aside-group--my-temp-guild'];
-    for (var i = 0; i < groups.length; i++) {
-      var titles = document.querySelectorAll(groups[i] + ' .group-title');
-      for (var j = 0; j < titles.length; j++) {
-        var h = titles[j];
-        for (var k = 0; k < h.childNodes.length; k++) {
-          var n = h.childNodes[k];
-          if (n.nodeType !== 3) continue;
-          var t = n.textContent || '';
-          if (t.indexOf('我的频道') !== -1) n.textContent = t.replace('我的频道', '网页账号加入的频道');
-        }
-      }
-    }
-    var mine = document.querySelector('.aside-group--txpd-joined .group-title');
-    if (mine && mine.textContent.indexOf('CLI账号') === -1) mine.textContent = 'CLI账号加入的频道';
-  }
-
   function ensureJoinedSection() {
     var nav = document.querySelector('.aside-nav');
     if (!nav) return;
@@ -2000,7 +1494,7 @@
     group.appendChild(list);
     var navGroup = nav.querySelector('.aside-group--nav');
     if (navGroup && navGroup.nextSibling) nav.insertBefore(group, navGroup.nextSibling);
-    else nav.insertBefore(group, nav.firstChild);
+    else nav.appendChild(group);
 
     getAccountsState().then(function (any) {
       var entry2 = document.getElementById('txpd-acct-entry');
@@ -2016,18 +1510,6 @@
   }
 
   // ---------- 通用小面板（对话框内容切换用） ----------
-  function openPanel(title, width) {
-    stopPoll();
-    showMask();
-    dlg.innerHTML = '';
-    dlg.style.width = width || 'min(480px,92vw)';
-    // 限高 + 内部滚动：表单再长也不会超出屏幕
-    dlg.style.maxHeight = '86vh';
-    dlg.style.overflowY = 'auto';
-    dlg.appendChild(el('button', { id: 'txpd-acct-close', style: 'float:right;border:none;background:none;font-size:20px;color:#999;cursor:pointer;line-height:1;' }, '×')).addEventListener('click', closeDlg);
-    dlg.appendChild(el('h3', { style: 'margin:0 0 12px;font-size:17px;color:#111;display:inline-block;' }, title));
-    return dlg;
-  }
   function fieldRow(labelText, inputEl) {
     var row = el('div', { style: 'margin:8px 0;' });
     var lab = el('div', { 'class': 'txpd-fld' }, labelText);
@@ -2077,6 +1559,7 @@
         }
       }
     }
+    if (!g && _nativeGuild && String(_nativeGuild.guild_number) === num) g = _nativeGuild;
     return { num: num, g: g, id: g ? g.guild_id : '' };
   }
 
@@ -2441,6 +1924,7 @@
   }
   function closePage() {
     _pageOpen = '';
+    if (PANEL_STARTUP.renderRoute) PANEL_STARTUP.renderRoute(true);
     ensurePageView();
     rememberPage();
     try { markNavActive(); } catch (e) { /* 忽略 */ }
@@ -2464,12 +1948,14 @@
       var n = _pageViews[k];
       if (k !== _pageOpen && n && n.parentNode) n.parentNode.removeChild(n);
     });
+    var nativeView = document.getElementById('txpd-route-view');
+    if (nativeView) nativeView.hidden = !!_pageOpen;
     if (!_pageOpen) {
       if (dyn) dyn.style.display = '';
       if (guildMain) guildMain.style.display = '';
       return;
     }
-    var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main') || document.body;
+    var host = document.getElementById('txpd-content');
     if (!host) return;
     if (explore) explore.style.display = 'none';
     if (dyn) dyn.style.display = 'none';
@@ -2492,11 +1978,6 @@
     _wlActive = false;   // 链停了就把标记也清掉：否则状态行会被永久冻结在「等待扫码…」
   }
   // 保留选择器行为；入口已经没有探索页的 SSR 内容。
-  function syncSsrExploreVisibility() {
-    var tail = routeKey();
-    document.documentElement.classList.toggle('txpd-deep-route', !!(tail && tail !== 'explore' && tail.indexOf('index') !== 0));
-  }
-
   function routeKey() {
     return _tailOf(window.location.pathname);
   }
@@ -2699,15 +2180,18 @@
         if (box && box.style.display !== 'none') pollWebLogin();
       }
     }).catch(function () { /* 忽略 */ });
-    api('/accounts').then(function (r) {
+    getAccountsState().then(function () {
       var st2 = document.getElementById('txpd-cli-status');
       if (!st2) return;
-      var accs = ((r && r.data && r.data.accounts) || []);
+      var accs = PANEL_STARTUP.accounts || [];
       var inOnes = accs.filter(function (a) { return a.logged_in; });
       if (!accs.length) st2.textContent = '状态：还没有账号槽位';
       else if (!inOnes.length) st2.textContent = '状态：未登录（' + accs.length + ' 个槽位）';
       else st2.textContent = '状态：已登录 ' + inOnes.map(function (a) { return a.nickname || a.name; }).join('、');
-    }).catch(function () { /* 忽略 */ });
+    }).catch(function (error) {
+      var status = document.getElementById('txpd-cli-status');
+      if (status) status.textContent = '账号状态加载失败：' + error.message;
+    });
   }
 
   // ---------- 定时发帖（整页视图：全部计划列表 + 新建 + 逐条删除/启停/立即运行） ----------
@@ -3028,58 +2512,6 @@
   }
 
   // 频道动态页的数据来自「频道账号（CLI）」。缺哪个就提示哪个，并给一个去登录的入口。
-  function pageLoginNeed() {
-    var tail = routeKey();
-    if (!tail || tail === 'explore' || tail.indexOf('g/') === 0) return 'web';
-    if (tail.indexOf('index') === 0) return 'cli';
-    return '';
-  }
-  var _noticeMissing = '';
-  function ensureLoginNotice() {
-    var need = pageLoginNeed();
-    var missing = '';
-    // 只要 CLI 账号在，网页没登录也照常看内容，不该再挡页面（以前会显示「网页未登录，无法查看」）
-    if (need === 'web' && !TXPD_WEB_LOGGED_IN && _cliLoggedIn === false) missing = '腾讯频道网页未登录，也没有可用的频道账号（CLI）';
-    else if (need === 'cli' && _cliLoggedIn === false) missing = '频道账号（CLI）未登录';
-    var box = document.querySelector('.txpd-login-notice');
-    var explore = document.getElementById('explorePage');
-    var dyn = document.querySelector('.txpd-dynamic');
-    var guildMain = document.querySelector('.game-guild-main');
-    if (_pageOpen) {
-      if (box && box.parentNode) box.parentNode.removeChild(box);
-      _noticeMissing = '';
-      return;   // 整页视图开着：提示让位（内容显隐由视图层管）
-    }
-    if (!missing) {
-      if (box && box.parentNode) box.parentNode.removeChild(box);
-      _noticeMissing = '';
-      if (guildMain) guildMain.style.display = '';
-      return;
-    }
-    if (explore) explore.style.display = 'none';
-    if (dyn) dyn.style.display = 'none';
-    if (guildMain) guildMain.style.display = 'none';
-    if (!box) {
-      box = el('div', { 'class': 'app-page txpd-login-notice' });
-      box.appendChild(el('div', { 'class': 'txpd-mg-card txpd-notice-card' }));
-      var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main') || document.body;
-      host.appendChild(box);
-    }
-    if (_noticeMissing !== missing) {
-      _noticeMissing = missing;
-      var card = box.firstChild;
-      card.innerHTML = '';
-      card.appendChild(el('h3', null, missing + '，无法查看'));
-      card.appendChild(el('p', { 'class': 'txpd-mg-desc' }, need === 'web'
-        ? '这个页面的内容按腾讯频道网页登录态渲染。到「插件管理 → 网页登录」扫码登录后即可查看；'
-          + '登录只影响显示，点赞 / 评论 / 发帖等操作始终由频道账号（CLI）完成。'
-        : '这个页面的数据来自插件账号（CLI）。到「插件管理 → 频道账号」登录后即可查看。'));
-      var btn = mgBtn('去登录', true);
-      btn.addEventListener('click', openManagePage);
-      card.appendChild(btn);
-    }
-  }
-
   // ---------- 手机端返回按钮：版块流/帖子详情等深视图提供退出出口 ----------
   function ensureMobileBackButton() {
     // 按视口宽度判断（<1024 视为移动布局），不用 UA 相关的 body 类
@@ -3168,16 +2600,6 @@
   ];
   var TXPD_NAV_CLASSES = ['txpd-nav-dynamic', 'txpd-nav-explore', 'txpd-nav-schedule', 'txpd-nav-dm', 'txpd-nav-admin'];
 
-  function navItemText(it) {
-    return ((it.textContent || '').trim());
-  }
-  function isTxpdNavItem(it) {
-    for (var i = 0; i < TXPD_NAV_CLASSES.length; i++) {
-      if (it.classList && it.classList.contains(TXPD_NAV_CLASSES[i])) return true;
-    }
-    return false;
-  }
-
   function mkNavItem(slot) {
     var a = el('a', { 'class': 'menu-item txpd-nav-' + slot.key, title: slot.label });
     a.style.cssText = 'cursor:pointer;';
@@ -3206,11 +2628,7 @@
       mine[slot.key] = node;
       if (!node.getAttribute('data-txpd-wired')) {
         node.setAttribute('data-txpd-wired', '1');
-        node.addEventListener('click', function (e) {
-          e.preventDefault();
-          e.stopPropagation();
-          slot.go();
-        });
+
       }
     });
     markNavActive(mine);
@@ -3310,20 +2728,6 @@
   function saveLikedSet(s) {
     try { window.localStorage.setItem('txpd_liked_feeds', JSON.stringify(s)); } catch (e) { /* 忽略 */ }
   }
-  function likeItemFeedId(item) {
-    var card = item;
-    for (var depth = 0; card && depth < 8; depth++) {
-      var pa = card.querySelector ? card.querySelector('a[href*="/post/"]') : null;
-      if (pa) { var pm = /\/post\/([^\/?#]+)/.exec(pa.getAttribute('href')); if (pm) return decodeURIComponent(pm[1]); }
-      card = card.parentElement;
-    }
-    // 帖子详情页：卡片无帖子链接，feed_id 从 URL 取（评论内的项除外）
-    if (!item.closest || !item.closest('.comment-list-item')) {
-      var um = /\/post\/([^\/?#]+)/.exec(window.location.pathname);
-      if (um) return decodeURIComponent(um[1]);
-    }
-    return '';
-  }
   function likedCommentsSet() {
     try { return JSON.parse(window.localStorage.getItem('txpd_liked_comments') || '{}'); } catch (e) { return {}; }
   }
@@ -3392,40 +2796,6 @@
       item.style.color = '';
     }
   }
-  function syncLikedMarks() {
-    var set = likedSet();
-    var cset = likedCommentsSet();
-    // 评论点赞显示（.comment-list-item__like-count）
-    var cCounts = document.querySelectorAll('.comment-list-item__like-count');
-    for (var ci = 0; ci < cCounts.length; ci++) {
-      var cEl = cCounts[ci];
-      var cHost = cEl.closest ? cEl.closest('.comment-list-item') : null;
-      if (!cHost) continue;
-      var cId = cHost.id || '';
-      if (!cId) continue;
-      applyLikeVisual(cEl, !!cset[cId]);
-    }
-    var items = document.querySelectorAll('[class*="operation__item"]');
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
-      var row = item.parentElement;
-      if (!row) continue;
-      var rowItems = row.querySelectorAll('[class*="operation__item"]');
-      if (rowItems[0] !== item) continue;
-      if (!item.offsetParent) continue;
-      var cOwner = item.closest ? item.closest('.comment-list-item') : null;
-      if (cOwner) {
-        var cid = cOwner.id || '';
-        if (cid) applyLikeVisual(item, !!cset[cid]);
-        continue;
-      }
-      var fid = likeItemFeedId(item);
-      if (!fid) continue;
-      applyLikeVisual(item, !!set[fid]);
-    }
-  }
-
-  // ---------- 频道头部元信息：频道号 / 加入方式 / 我的身份 ----------
   var _joinSettingCache = {};
   function joinTypeText(raw) {
     var s = String(raw || '');
@@ -3542,53 +2912,6 @@
     }
     return box;
   }
-  function ensureGuildHeaderFallback() {
-    if (_pageOpen) return;                       // 整页视图不参与
-    var num = currentGuildNumber();
-    if (!num) return;
-    var gm = document.querySelector('.game-guild-main');
-    if (!gm) return;
-    var mine = gm.querySelector('.txpd-guild-header');
-    var officialName = gm.querySelector('.guild-info__basic__name');
-    if (officialName && (officialName.textContent || '').trim()) {
-      if (mine && mine.parentNode) mine.parentNode.removeChild(mine);   // 官方自己渲染了 → 撤掉兜底
-      return;
-    }
-    var hit = _ghCache[num];
-    var fresh = hit && (Date.now() - hit.ts < (hit.data ? 300000 : 60000));
-    if (hit && hit.data) {
-      if (!mine) {
-        mine = buildGuildHeader(hit.data, num);
-        gm.insertBefore(mine, gm.firstChild);
-      }
-      var nm = mine.querySelector('.guild-info__basic__name');
-      if (nm) nm.textContent = hit.data.name || num;
-      var st = mine.querySelector('.txpd-gh-stat');
-      if (st) {
-        var parts = [];
-        if (hit.data.member_count) parts.push(hit.data.member_count + ' 成员');
-        if (hit.data.guild_number) parts.push('频道号: ' + hit.data.guild_number);
-        if (hit.data.guild_type) parts.push(hit.data.guild_type);
-        st.textContent = parts.join('　');
-      }
-      return;
-    }
-    if (fresh) return;                           // 拉过（成功但还没数据 / 失败冷却中）
-    _ghCache[num] = { ts: Date.now(), data: null };
-    // 频道 id 不在 CLI 频道列表里（比如网页账号加入、CLI 未加入）→ 用频道号反查一次
-    var fetchBy = function (gid) {
-      if (!gid) return;
-      api('/cli', { method: 'POST', body: { action: 'guild-info', params: { guild_id: gid } } }).then(function (r) {
-        if (!r.success) return;                  // 冷却 60s 后重试
-        _ghCache[num] = { ts: Date.now(), data: ((r.data && r.data.data) || {}) };
-        try { queueUiSync(); } catch (e) { /* 忽略 */ }
-      }).catch(function () { /* 忽略 */ });
-    };
-    var g = currentGuild();
-    if (g.id) fetchBy(g.id);
-    else resolveGuildIdByNumber(num, fetchBy);
-  }
-
   function ensureGuildMeta() {
     var h4 = document.querySelector('.guild-info__basic__statistics');
     var hostBasic = (h4 && h4.parentNode) ? h4.parentNode : document.querySelector('.guild-info__basic');
@@ -3824,16 +3147,6 @@
       if (all[i].getClientRects().length) return all[i];
     }
     return all[0] || null;
-  }
-
-  function escHtml(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-  function renderPreview(content) {
-    var html = escHtml(content);
-    html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" style="color:#2b64f5;">$1</a>');
-    html = html.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
-    return html.replace(/\n/g, '<br>');
   }
 
   var OFFICIAL_COMPOSER_HTML = "<div class=\"editor-area\" data-v-1c099b7e><div class=\"editor-header pointer\" data-v-1c099b7e><div class=\"user-info\" data-v-1c099b7e><img src=\"https://qqchannel-profile-1251316161.file.myqcloud.com/wxxcxdefault\" class=\"avatar\" alt=\"\" data-v-1c099b7e><span class=\"user-name\" data-v-1c099b7e>\u53d1\u5e16\u5c06\u4ee5 CLI \u5f53\u524d\u8d26\u53f7\u8eab\u4efd\u53d1\u8868\uff0c\u70b9\u51fb\u6b64\u5904\u8f93\u5165</span></div><div class=\"toolbar-area\" data-v-1c099b7e><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-emoji\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#emoji\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg class=\"icon-svg-symbol icon-image\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#image\"></use></svg></span><!--]--><!----><!--]--><!--[--><!--[--><span class=\"toolbar-button\" data-v-1c099b7e><svg width=\"20\" height=\"20\" class=\"icon-svg\" viewbox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\" data-v-1c099b7e><path d=\"M10.078 13.797C9.60006 13.4587 8.96861 13.0501 8.43374 12.8338C7.26763 12.3622 5.6115 12.4205 4.38399 12.5621C3.53188 12.6605 2.72986 12.0143 2.72986 11.1565C2.72986 9.83204 2.72986 8.72527 2.72986 7.38215C2.72986 6.57948 3.43379 5.95326 4.23474 6.00586C5.4523 6.08583 7.16672 6.12682 8.43374 5.86935C10.1696 5.51659 12.1915 4.37484 13.7037 3.38356C14.641 2.76907 15.9691 3.42615 15.9691 4.54697C15.9691 6.31738 15.9691 7.78715 15.9691 9.88398\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\" stroke-linecap=\"square\"></path><path d=\"M7.03646 12.4248L7.91263 15.3797C8.1828 16.2908 7.50008 17.2053 6.54973 17.2053V17.2053C5.92028 17.2053 5.36578 16.7914 5.18683 16.1879L4.071 12.4248\" stroke=\"currentColor\" style=\"stroke:currentColor;stroke-opacity:1;\" stroke-width=\"1.14167\"></path><path d=\"M14.6181 11.8909C14.7569 11.5392 15.2546 11.5392 15.3934 11.8909L16.0345 13.5165C16.0769 13.6239 16.1619 13.7089 16.2693 13.7513L17.8949 14.3924C18.2467 14.5312 18.2467 15.0289 17.8949 15.1677L16.2693 15.8088C16.1619 15.8512 16.0769 15.9362 16.0345 16.0436L15.3934 17.6692C15.2546 18.0209 14.7569 18.0209 14.6181 17.6692L13.977 16.0436C13.9346 15.9362 13.8496 15.8512 13.7423 15.8088L12.1166 15.1677C11.7649 15.0289 11.7649 14.5312 12.1166 14.3924L13.7423 13.7513C13.8496 13.7089 13.9346 13.6239 13.977 13.5165L14.6181 11.8909Z\" fill=\"currentColor\" style=\"fill:currentColor;fill-opacity:1;\"></path></svg></span><!--]--><!----><!--]--><!----><!--[--><!--[--><!--]--><!----><!--]--><span data-v-1c099b7e></span><span class=\"toolbar-button txpd-pub-close\" data-v-1c099b7e title=\"关闭发帖\"><svg class=\"icon-svg-symbol icon-close\" style=\"color:currentColor;width:20px;height:20px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#close\"></use></svg></span></div></div><div class=\"editor-divider\" data-v-1c099b7e></div><div class=\"editor-root-container\" data-v-1c099b7e><div class=\"ProseMirror\" contenteditable=\"true\" data-txpd-content data-v-1c099b7e></div></div><div class=\"upload-area\" data-v-1c099b7e><div class=\"upload-left\" data-v-1c099b7e><!--[--><div class=\"image-video-container\" data-v-90ae7ef7><div class=\"preview-list\" data-v-90ae7ef7><!----><!----><div class=\"upload-button\" style=\"top:0;left:0;\" data-v-90ae7ef7><svg class=\"icon-svg-symbol icon-add-upload\" style=\"color:currentColor;width:36px;height:36px;\" data-v-90ae7ef7><use xlink:href=\"assets/common.svg#add-upload\"></use></svg></div></div></div><!----><!--]--><!----></div><div class=\"bottom-bar\" data-v-1c099b7e><div class=\"word-count\" data-v-1c099b7e>0/1000</div><div class=\"chose-channel\" data-v-1c099b7e><button class=\"g-button g-button--default g-button--small chose-channel-btn\" style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--><!----> \u4e0d\u9009\u62e9\u7248\u5757 <svg class=\"icon-svg-symbol icon-arrow-right\" style=\"color:currentColor;width:10px;height:10px;margin-left:4px;\" data-v-1c099b7e><use xlink:href=\"assets/common.svg#arrow-right\"></use></svg><!--]--></button></div><!----><div class=\"publish-button\" data-v-1c099b7e><button class=\"g-button g-button--primary g-button--small btn\" disabled style=\"overflow:hidden;white-space:nowrap;\" data-v-1c099b7e><!--[--> \u53d1\u8868<!--]--></button></div></div></div></div>";
@@ -4917,7 +4230,6 @@
       loadComments();
     }).catch(function (e) {
       wrap.innerHTML = '';
-      if (fallbackUrl) { openEmbedOverlay(fallbackUrl, '帖子详情'); return; }   // CLI 拿不到就回退官方 iframe
       wrap.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '加载失败：' + String((e && e.message) || e).slice(0, 120)));
     });
   }
@@ -5173,45 +4485,6 @@
     page.appendChild(cont);
     return page;
   }
-  function dynReset() {
-    _dyn.tab = 'hot';
-    _dyn.feeds = [];
-    _dyn.seen = {};
-    _dyn.gidx = 0;
-    _dyn.loading = false;
-    _dyn.done = false;
-    _dyn.started = false;
-    _dyn.icons = {};
-    _dyn.user = TXPD_USER || 'default';
-  }
-  function ensureDynamicPage() {
-    // 账号切换后缓存失效：重置（图标缓存按账号分键，也会随之切换）
-    if (_dyn.user !== (TXPD_USER || 'default')) dynReset();
-    var tail = window.location.pathname.slice(PANEL_BASE.length);
-    var isIndex = tail === 'index' || tail.indexOf('index') === 0;
-    var page = document.querySelector('.txpd-dynamic');
-    var explore = document.getElementById('explorePage');
-    if (!isIndex) {
-      if (page && page.parentNode) page.parentNode.removeChild(page);
-      if (explore && explore.style.display === 'none') explore.style.display = '';
-      return;
-    }
-    if (explore) explore.style.display = 'none';
-    if (!page) {
-      var host = (explore && explore.parentNode) || document.querySelector('main') || document.querySelector('.app-main');
-      if (!host) return;
-      page = buildDynamicShell();
-      host.appendChild(page);
-      // 回到动态页：先用缓存渲染（秒开），首次再拉数据
-      _dyn.icons = dynIconCache();
-      dynRender();
-    }
-    if (!_dyn.started) {
-      _dyn.started = true;
-      dynLoadMore();
-    }
-  }
-
   // ---------- 帖子详情浮层：点卡片就地打开（不再整页跳转） ----------
   function closeEmbedOverlay() {
     var ov = document.getElementById('txpd-embed-overlay');
@@ -5225,14 +4498,11 @@
     var bar = el('div', { id: 'txpd-embed-bar' });
     var tEl = el('span', { id: 'txpd-embed-title' });
     var close = el('button', { id: 'txpd-embed-close', type: 'button', title: '关闭' }, '×');
-    var frame = el('iframe', { id: 'txpd-embed-frame', title: '帖子详情' });
-    frame.setAttribute('allow', 'clipboard-write');
     var dom = el('div', { id: 'txpd-embed-dom' });
     bar.appendChild(tEl);
     bar.appendChild(close);
     card.appendChild(bar);
     card.appendChild(dom);
-    card.appendChild(frame);
     ov.appendChild(card);
     document.body.appendChild(ov);
     close.addEventListener('click', closeEmbedOverlay);
@@ -5240,24 +4510,20 @@
     window.addEventListener('keydown', function (e) {
       if (e.key === 'Escape' && ov.style.display === 'flex') closeEmbedOverlay();
     }, true);
-    ov._frame = frame; ov._title = tEl; ov._dom = dom;
+    ov._title = tEl; ov._dom = dom;
     return ov;
   }
   function openEmbedOverlay(url, title) {
-    var ov = ensureOverlayShell();
-    ov._dom.className = '';
-    ov._dom.style.display = 'none';
-    ov._dom.innerHTML = '';
-    ov._frame.style.display = 'block';
-    ov._title.textContent = title || '帖子详情';
-    ov.style.display = 'flex';
-    if (ov._frame.getAttribute('src') !== url) ov._frame.setAttribute('src', url);
+    var match = /\/g\/([^/?#]+)\/post\/([^/?#]+)/.exec(url || '');
+    if (!match) return false;
+    resolveGuildIdByNumber(decodeURIComponent(match[1]), function (gid) {
+      openCliDetailOverlay(decodeURIComponent(match[2]), gid, title);
+    });
     return true;
   }
   // 访客限制频道：官方详情页同样被挡 → 用 CLI 数据在本插件浮层里渲染
   function openCliDetailOverlay(feedId, guildId, title, fallbackUrl) {
     var ov = ensureOverlayShell();
-    ov._frame.style.display = 'none';
     ov._dom.className = 'txpd-dom-detail';
     ov._dom.style.display = 'flex';
     ov._dom.innerHTML = '';
@@ -5337,13 +4603,6 @@
   }
 
   // 官方底部输入栏占位是「登录后评论」（匿名态文案），这里改成官方登录态的占位
-  function syncCommentPlaceholder() {
-    var bar = document.querySelector('.bottom-input');
-    if (!bar || bar.getAttribute('data-txpd-editor') === '1') return;
-    var txt = bar.querySelector('.bottom-input__text');
-    if (txt && txt.textContent !== '说点什么…') txt.textContent = '说点什么…';
-  }
-
   function openInlineComment(mode, commentId, commentEl, hostEl) {
     var bar = (hostEl && hostEl.classList && hostEl.classList.contains('bottom-input')) ? hostEl : document.querySelector('.bottom-input');
     if (!bar) { openCommentFlow(mode, commentId); return; }  // 兜底：没有底部输入条的页面仍走弹窗
@@ -5447,20 +4706,16 @@
   }
   var _uiSyncQueued = false;
   function syncPanelUi() {
-      ensureTopbarButtons();
-      ensureNavEntries();
-      syncPublishArea();
-      refreshJoinedAvatars();   // 官方「我的频道」晚一步渲染：每轮回来把头补齐
-      syncAsideTitles();        // 官方「我的频道」标题按来源改名（会被应用重渲染还原）
-      ensureMobileBackButton();
-      ensureNarrowDrawer();
-      syncLikedMarks();
-      ensureGuildMeta();
-      syncCommentPlaceholder();
-      syncSsrExploreVisibility();
-      ensureDynamicPage();
-      ensurePageView();       // 放在动态页之后：整页视图要能盖住动态页
-      ensureLoginNotice();    // 缺登录态的页面显示「无法查看」提示
+    ensureNavEntries(); ensureTopbarButtons(); syncPublishArea();
+    ensureMobileBackButton(); ensureNarrowDrawer();
+    ensurePageView(); markNavActive();
+    var badge = document.querySelector('.guild-info .join-guild-button');
+    if (badge && _joinedKeys) {
+      var ctx = currentGuild();
+      var joined = !!(_joinedKeys[ctx.num] || _joinedKeys[ctx.id]);
+      badge.textContent = joined ? '✓ 已加入' : '';
+      badge.style.display = joined ? '' : 'none';
+    }
   }
   PANEL_STARTUP.sync = syncPanelUi;
   function queueUiSync() {
@@ -5479,11 +4734,11 @@
   function mount() {
     if (!document.body) { setTimeout(mount, 100); return; }
     applyCachedAcctState();
+    rememberPage();
     ensureJoinedSection();
-    queueUiSync();
     // 页面提示需要 CLI 登录态；顺带在没有任何已登录账号时打开插件管理引导登录
     getAccountsState().catch(function () { /* 忽略 */ });
-    // 未登录时的管理页在启动状态中已选定，不再先显示探索页再延时跳转。
+    // 页面先同步挂载，状态与内容请求在后台独立完成。
     // （document 层的监听收不到事件），同层后注册的监听仍可运行
     window.addEventListener('click', function (e) {
       var t = e.target, btn = null, anchor = null;
@@ -5720,4 +4975,398 @@
   }
   // 由启动器在组件树就绪后挂载，避免 DOMContentLoaded 早于异步组件。
   PANEL_STARTUP.mount = mount;
+  var nativeVersion = 0;
+  var nativeRoute = '';
+  var nativeCache = Object.create(null);
+  var nativePending = Object.create(null);
+  var _nativeGuild = null;
+
+  function nativeData(action, params) {
+    var key = TXPD_USER + ':' + action + ':' + JSON.stringify(params || {});
+    if (nativeCache[key] && Date.now() - nativeCache[key].ts < 30000) return Promise.resolve(nativeCache[key].data);
+    if (nativePending[key]) return nativePending[key];
+    nativePending[key] = api('/cli', { method: 'POST', body: { action: action, params: params || {} } }).then(function (r) {
+      if (!r.success) throw new Error(r.message || r.raw || '加载失败');
+      var data = r.data || {};
+      if (data.data && typeof data.data === 'object') data = data.data;
+      nativeCache[key] = { ts: Date.now(), data: data };
+      return data;
+    }).finally(function () { delete nativePending[key]; });
+    return nativePending[key];
+  }
+  function nativeLoading(host, message) {
+    host.replaceChildren(el('div', { 'class': 'txpd-native-loading' }, message || '加载中…'));
+  }
+  function nativeError(host, error, retry) {
+    if (!host.isConnected) return;
+    var box = el('div', { 'class': 'txpd-native-error' });
+    box.appendChild(el('p', null, String(error.message || error)));
+    var button = mgBtn('重新加载', true);
+    button.onclick = retry;
+    box.appendChild(button);
+    host.replaceChildren(box);
+  }
+  function nativeFeedList(host, action, params, guild) {
+    var token = nativeVersion;
+    var cursor = '';
+    var seen = Object.create(null);
+    var list = el('div', { 'class': 'txpd-native-feed-list feed-list-content' });
+    list.setAttribute('data-v-0c4f7dca', '');
+    if (guild) list.style.cssText = 'max-width:none;margin:0;padding:0;';
+    host.replaceChildren(list);
+    var more = mgBtn('加载更多');
+    more.style.cssText = 'display:block;margin:16px auto;';
+    function load() {
+      more.disabled = true;
+      more.textContent = '加载中…';
+      var query = Object.assign({}, params);
+      if (cursor) query.feed_attach_info = cursor;
+      return nativeData(action, query).then(function (data) {
+        if (token !== nativeVersion || !host.isConnected) return;
+        if (!cursor) list.replaceChildren();
+        var feeds = data.feeds || [];
+        feeds.forEach(function (feed) {
+          if (seen[feed.feed_id]) return;
+          seen[feed.feed_id] = true;
+          if (guild) {
+            feed.guild_id = feed.guild_id || guild.guild_id;
+            feed.guild_number = feed.guild_number || guild.guild_number;
+            feed.guild_name = feed.guild_name || guild.name;
+          }
+          feed.content_snippet = feed.content_snippet || feed.content || '';
+          list.appendChild(dynItemEl(feed));
+        });
+        if (!Object.keys(seen).length) {
+          if (host._emptyView) list.appendChild(host._emptyView);
+          else list.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '暂无帖子'));
+        }
+        var next = String(data.feed_attach_info || data.feedAttachInfo || '');
+        if (next && next !== cursor && feeds.length) {
+          cursor = next;
+          more.disabled = false;
+          more.textContent = '加载更多';
+          list.appendChild(more);
+        } else more.remove();
+      }).catch(function (error) { nativeError(list, error, load); });
+    }
+    more.onclick = load;
+    nativeLoading(list, '正在加载帖子…');
+    load();
+  }
+  function nativeGuildId(num) {
+    return loadJoinedGuilds().then(function (guilds) {
+      var guild = guilds.find(function (g) { return String(g.guild_number) === num || String(g.guild_id) === num; });
+      if (guild) return guild;
+      return nativeData('search-guild', { keyword: num }).then(function (data) {
+        var found = (data.channels || []).find(function (g) { return String(g.guild_number) === num || String(g.guild_id) === num; });
+        if (!found || !found.guild_id) throw new Error('未找到频道，请检查频道号或账号权限');
+        return found;
+      });
+    });
+  }
+  var nativeGuildMarkup = null;
+  function guildTemplate() {
+    if (!nativeGuildMarkup) nativeGuildMarkup = fetch(PANEL_BASE + 'assets/guild-view.html').then(function (response) {
+      if (!response.ok) throw new Error('频道页面加载失败（HTTP ' + response.status + '）');
+      return response.text();
+    }).catch(function (error) { nativeGuildMarkup = null; throw error; });
+    return nativeGuildMarkup;
+  }
+  function nativeGuild(host, num, subpath, id) {
+    var token = nativeVersion;
+    nativeLoading(host, '正在加载频道…');
+    Promise.all([nativeGuildId(num), guildTemplate()]).then(function (results) {
+      if (token !== nativeVersion) return;
+      var guild = results[0];
+      _nativeGuild = guild;
+      _gidByNumber[num] = guild.guild_id;
+      if (subpath === 'post') {
+        host.replaceChildren();
+        renderCliFeedDetail(host, id, guild.guild_id, '');
+        return;
+      }
+      var template = document.createElement('template');
+      template.innerHTML = results[1];
+      var page = template.content.querySelector('main');
+      var empty = template.content.querySelector('#txpd-guild-empty').content.firstElementChild.cloneNode(true);
+      host.replaceChildren(page);
+      var header = page.querySelector('.title-bar-container');
+      var feedHost = page.querySelector('#scrollableDiv');
+      feedHost._emptyView = empty;
+      var publish = page.querySelector('.publish-editor-container');
+      hookPublishArea(publish);
+      page.querySelector('.publish-feed-btn').onclick = function () { expandPublishEditor(publish); };
+      empty.querySelector('.info-btn').onclick = function () { expandPublishEditor(publish); };
+      function showHeader(info) {
+        if (token !== nativeVersion) return;
+        Object.assign(guild, info);
+        guild.name = guild.name || guild.guild_name || num;
+        header.querySelector('.guild-info__basic__name').textContent = guild.name;
+        var searchGuild = document.querySelector('.search-guild');
+        searchGuild.style.display = '';
+        searchGuild.querySelector('.guild-name').textContent = guild.name;
+        var tips = searchGuild.querySelectorAll('.tip');
+        tips[0].textContent = '在'; tips[1].textContent = '搜索';
+        var placeholder = document.querySelector('.search-content .place-holder');
+        if (placeholder) placeholder.style.display = 'none';
+        header.querySelector('.guild-info__basic__statistics span').textContent = guild.member_count || '';
+        var avatar = guild.avatar_url || 'https://groupprohead.gtimg.cn/' + encodeURIComponent(guild.guild_id) + '/100';
+        var cover = guild.cover_url || 'https://groupprocover.gtimg.cn/' + encodeURIComponent(guild.guild_id) + '?imageView2/1/w/750/h/388/q/70/format/webp';
+        if (/^https?:\/\//.test(avatar)) header.querySelector('.guild-info__icon').style.backgroundImage = 'url("' + avatar.replace(/["\\\r\n]/g, '') + '")';
+        if (/^https?:\/\//.test(cover)) header.querySelector('.right-background-image').src = cover;
+        var joined = !!(_joinedKeys && (_joinedKeys[num] || _joinedKeys[guild.guild_id]));
+        var badge = header.querySelector('.join-guild-button');
+        badge.textContent = joined ? '✓ 已加入' : '';
+        badge.style.display = joined ? '' : 'none';
+        ensureGuildMeta();
+        ensureTopbarButtons();
+        syncPublishArea();
+        enforceImgPolicy(page);
+      }
+      showHeader({});
+      nativeData('guild-info', { guild_id: guild.guild_id }).then(showHeader).catch(function () {});
+      var tabs = page.querySelector('.game-guild-main-tab-bar .swiper-wrapper');
+      tabs.parentNode.style.overflowX = 'auto';
+      var sort = new URLSearchParams((PANEL_STARTUP.route || '').split('?')[1] || '').get('sort') || 'hot';
+      function tab(label, channel, kind) {
+        var active = subpath === 'text' ? String(channel) === id : !channel && sort === kind;
+        var slide = el('div', { 'class': 'swiper-slide', style: 'width:auto;flex-shrink:0;', 'data-v-2bac90f6': '' });
+        var button = el('button', { type: 'button', 'class': 'tab-bar__item' + (active ? ' is-active' : ''), 'data-v-2bac90f6': '', style: 'border:0;background:none;font:inherit;padding:0;cursor:pointer;' });
+        button.appendChild(el('h3', { 'class': 'tab-bar__item__text', 'data-v-2bac90f6': '' }, label));
+        button.onclick = function () { spaNavigate('g/' + encodeURIComponent(num) + (channel ? '/text/' + encodeURIComponent(channel) : '?sort=' + kind)); };
+        slide.appendChild(button); tabs.appendChild(slide);
+      }
+      tab('全部', '', 'all'); tab('热门', '', 'hot');
+      nativeData('channels', { guild_id: guild.guild_id }).then(function (data) {
+        if (token !== nativeVersion) return;
+        (data.channels || []).forEach(function (channel) { tab(channel.channel_name || channel.name || channel.channel_id, String(channel.channel_id), ''); });
+      }).catch(function (error) { tabs.appendChild(el('span', { 'class': 'txpd-cli-empty' }, '版块加载失败：' + error.message)); });
+      var share = header.querySelector('.operation-item.share');
+      share.onclick = function () { copyText('https://pd.qq.com/g/' + num, share); };
+      var notice = header.querySelector('.operation-item.notify');
+      notice.onclick = function () {
+        var box = openPopover(notice, '互动消息');
+        nativeLoading(box, '正在加载…');
+        nativeData('notices', { guild_id: guild.guild_id }).then(function (data) {
+          box.replaceChildren(el('h3', null, '互动消息'));
+          var items = data.notices || data.items || [];
+          items.forEach(function (item) { box.appendChild(el('p', null, item.content || item.text || item.title || '新的互动消息')); });
+          if (!items.length) box.appendChild(el('p', { 'class': 'txpd-cli-empty' }, '暂无互动消息'));
+        }).catch(function (error) { nativeError(box, error, notice.onclick); });
+      };
+      var settings = header.querySelector('.operation-item.setting');
+      settings.onclick = function () {
+        var box = openPopover(settings, '频道设置');
+        [['频道配置', function () { openGuildConfig(settings); }], ['成员列表', function () { openMemberList(settings); }], ['定时发帖', function () { openPage('schedule'); }]].forEach(function (item) {
+          var button = mgBtn(item[0]); button.onclick = item[1]; box.appendChild(button);
+        });
+      };
+      nativeFeedList(feedHost, subpath === 'text' ? 'feed-timeline' : 'feeds', { guild_id: guild.guild_id, channel_id: subpath === 'text' ? id : '', get_type: sort === 'hot' ? '1' : '2', count: '20' }, guild);
+    }).catch(function (error) { if (token === nativeVersion) nativeError(host, error, function () { renderNativeRoute(true); }); });
+  }
+  function nativeRecommendations(cursor) {
+    return api('/pd/qunng/guild/gotrpc/noauth/trpc.group_pro.hot_recommend.HotRecommend/GetContentRecommend', {
+      method: 'POST', timeout: 10000,
+      headers: { 'x-oidb': JSON.stringify({ uint32_command: '0x90f4', uint32_service_type: '3' }), 'X-QQ-Client-AppId': '537246381' },
+      body: { source: { scene_id: 11, bid: 'PC' }, cookies: cursor || '', direction: 1, refresh_num: 0, session_id: '', busi_info: '', visitor_msg: '', user_recommend_type: 0, navigation_version: '' }
+    }).then(function (response) {
+      var data = response.data || {};
+      if (response.retcode !== 0 || !Array.isArray(data.recommend_list)) throw new Error('推荐内容暂不可用');
+      var result = { channels: [], feeds: [], order: [], cursor: data.cookie || '' };
+      data.recommend_list.forEach(function (item) {
+        if (item.content_recommend_guild) {
+          var g = item.content_recommend_guild;
+          result.channels.push({ guild_id: g.guild_id, guild_number: g.guild_number, name: g.guild_name, avatar_url: g.guild_avatar, cover_url: g.cover, profile: g.guild_profile });
+          result.order.push('guild:' + g.guild_id);
+        } else if (item.feed) {
+          var f = item.feed, info = f.guild_info || {}, stats = f.feed_stat || {}, poster = f.poster || {};
+          var text = (((f.rich_text || {}).contents) || []).map(function (part) { return part.text_content ? part.text_content.text || '' : ''; }).join('');
+          result.feeds.push({ feed_id: f.id, guild_id: info.guild_id, guild_number: info.guild_number, guild_name: info.guild_name, guild_avatar: info.guild_icon, channel_id: info.channel_id, author: poster.nick || '', author_id: poster.tiny_id || '', title: f.title || '', content_snippet: text, create_time_raw: f.create_time, feed_type: f.feed_type, prefer_count: stats.prefer_count || 0, comment_count: stats.total_comment_count || 0, images: ((f.image || {}).thumb_images || []).map(function (image) { return image.url; }) });
+          if (info.guild_icon) _dyn.icons[info.guild_id] = info.guild_icon;
+          result.order.push('feed:' + f.id);
+        }
+      });
+      return result;
+    }).catch(function (error) {
+      if (cursor) throw error;
+      // 非交互的列表命令可直接调用；hot-feeds-detail 会停在 CLI 的频道选择阶段。
+      return loadJoinedGuilds().then(function (guilds) {
+        if (!guilds.length) throw error;
+        return Promise.allSettled(guilds.slice(0, 2).map(function (guild) {
+          return nativeData('feeds', { guild_id: guild.guild_id, get_type: '1', count: '10' }).then(function (data) {
+            return (data.feeds || []).map(function (feed) { return Object.assign({}, feed, { guild_id: guild.guild_id, guild_number: guild.guild_number, guild_name: guild.name }); });
+          });
+        })).then(function (results) {
+          var feeds = [];
+          results.forEach(function (result) { if (result.status === 'fulfilled') feeds = feeds.concat(result.value); });
+          if (!feeds.length && results.every(function (result) { return result.status === 'rejected'; })) throw error;
+          return { feeds: feeds, fallback: true };
+        });
+      });
+    });
+  }
+  function nativeExplore(host, keyword) {
+    var token = nativeVersion;
+    var page = el('main', { id: 'explorePage', 'class': 'app-page page--explore', 'data-v-02483d49': '' });
+    var container = el('div', { 'class': 'page-container', 'data-v-02483d49': '' });
+    var title = el('div', { 'class': 'title-area', 'data-v-f3e8307c': '', style: 'padding:24px 24px 0;' });
+    title.appendChild(el('h1', { 'class': 'title', 'data-v-f3e8307c': '' }, keyword ? '搜索结果：' + keyword : '为你推荐精选频道和内容'));
+    title.appendChild(el('div', { 'class': 'sub-title', 'data-v-f3e8307c': '' }, '游戏、校园、动漫、娱乐，更多精彩频道等你发现'));
+    var cards = el('div', { 'class': 'txpd-native-explore' });
+    container.append(title, cards);
+    page.appendChild(container);
+    host.appendChild(page);
+    var guildNum = new URLSearchParams((PANEL_STARTUP.route || '').split('?')[1] || '').get('guild') || '';
+    var cursor = '', pending = false, finished = false, seen = Object.create(null);
+    var moreButton = mgBtn('加载更多');
+    moreButton.style.cssText = 'display:none;margin:16px auto;';
+    container.appendChild(moreButton);
+    moreButton.hidden = true;
+    function load(append) {
+      if (pending || (append && finished)) return;
+      pending = true; moreButton.disabled = true;
+      if (!append) nativeLoading(cards, keyword ? '正在搜索频道…' : '正在加载推荐内容…');
+      var request = keyword && guildNum ? nativeGuildId(guildNum).then(function (guild) {
+        return nativeData('feed-search', { guild_id: guild.guild_id, keyword: keyword });
+      }) : keyword ? nativeData('search-guild', { keyword: keyword, next_page_token: append ? cursor : '' }) : nativeRecommendations(append ? cursor : '');
+      request.then(function (data) {
+        if (token !== nativeVersion) return;
+        if (!append) { cards.replaceChildren(); seen = Object.create(null); }
+        var oldCount = cards.children.length;
+        if (data.fallback) cards.appendChild(el('div', { 'class': 'txpd-cli-empty', style: 'grid-column:1/-1;' }, '推荐暂不可用，以下是已加入频道的热门内容'));
+        var guilds = data.channels || [];
+        guilds.forEach(function (guild) {
+          if (seen['guild:' + guild.guild_id]) return;
+          seen['guild:' + guild.guild_id] = true;
+          var num = guild.guild_number || guild.guild_id;
+          var card = el('a', { 'class': 'card-item guild-card', href: PANEL_BASE + 'g/' + encodeURIComponent(num) });
+          card.setAttribute('data-native-key', 'guild:' + guild.guild_id);
+          card.innerHTML = '<div class="guild-cover"></div><div class="guild-card-content"><div class="content-left"><div class="guild-icon"></div></div><div class="content-right"><div class="guild-name-area"><div class="name"></div></div><div class="guild-profile"></div></div></div><div class="guild-join-btn"><button class="join-btn" type="button"></button></div>';
+          var cover = guild.cover_url || guild.cover;
+          var avatar = guild.avatar_url || guild.guild_avatar;
+          if (cover && /^https?:\/\//.test(cover)) card.querySelector('.guild-cover').appendChild(el('img', { src: cover, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer' }));
+          if (avatar && /^https?:\/\//.test(avatar)) card.querySelector('.guild-icon').appendChild(el('img', { src: avatar, alt: '', referrerpolicy: 'no-referrer' }));
+          card.querySelector('.name').textContent = guild.name || guild.guild_name || num;
+          card.querySelector('.guild-profile').textContent = guild.profile || guild.guild_profile || '';
+          var joined = !!(_joinedKeys && (_joinedKeys[num] || _joinedKeys[guild.guild_id]));
+          card.querySelector('.join-btn').textContent = joined ? '已加入' : '加入';
+          [card].concat(Array.from(card.querySelectorAll('*'))).forEach(function (node) { node.setAttribute('data-v-88955103', ''); });
+          cards.appendChild(card);
+        });
+        (data.feeds || data.items || []).forEach(function (item) {
+          var feed = item.feed || item;
+          if (seen['feed:' + feed.feed_id]) return;
+          seen['feed:' + feed.feed_id] = true;
+          feed.content_snippet = feed.content_snippet || feed.content || '';
+          var card = dynItemEl(feed);
+          card.setAttribute('data-native-key', 'feed:' + feed.feed_id);
+          card.className = 'card-item feed-card ' + (String(feed.feed_type) === '2' ? 'feed-long' : 'feed-short');
+          var time = card.querySelector('.create-time');
+          if (time) time.remove();
+          var imageArea = card.querySelector('.image-area');
+          var images = cliImageUrls(feed.images);
+          if (images.length) {
+            var wrapper = el('div', { 'class': 'image-wrapper', 'data-v-0459e220': '' });
+            wrapper.appendChild(el('img', { src: images[0], 'class': 'image-item', 'data-v-0459e220': '', style: 'width:100%;height:auto;max-height:311px;object-fit:cover;', loading: 'lazy', referrerpolicy: 'no-referrer', alt: '' }));
+            imageArea.replaceChildren(wrapper);
+          }
+          Array.from(card.querySelectorAll('.operation-item')).forEach(function (operation) {
+            var svg = operation.querySelector('svg');
+            if (svg) { var icon = el('div', { 'class': 'icon' }); svg.replaceWith(icon); icon.appendChild(svg); }
+          });
+          [card].concat(Array.from(card.querySelectorAll('*'))).forEach(function (node) {
+            node.removeAttribute('data-v-b1adbc97');
+            node.setAttribute('data-v-88955103', '');
+          });
+          cards.appendChild(card);
+        });
+        if (data.order) {
+          Array.from(cards.children).slice(oldCount).sort(function (a, b) { return data.order.indexOf(a.getAttribute('data-native-key')) - data.order.indexOf(b.getAttribute('data-native-key')); }).forEach(function (card) { cards.appendChild(card); });
+        }
+        var next = String(data.cursor || data.next_page_token || '');
+        finished = !next || next === cursor; cursor = next;
+        moreButton.hidden = finished; moreButton.style.display = finished ? 'none' : 'block'; moreButton.disabled = false;
+        if (!cards.children.length) cards.appendChild(el('div', { 'class': 'txpd-cli-empty' }, keyword ? '没有找到相关频道' : '暂无推荐内容'));
+      }).catch(function (error) { if (token === nativeVersion) { finished = true; moreButton.hidden = true; moreButton.style.display = 'none'; nativeError(cards, error, function () { load(false); }); } }).finally(function () { pending = false; });
+    }
+    moreButton.onclick = function () { load(true); };
+    host.addEventListener('scroll', function () { if (host.scrollTop + host.clientHeight >= host.scrollHeight - 240) load(true); });
+    load();
+  }
+  function renderNativeRoute(force) {
+    var route = PANEL_STARTUP.route || 'explore';
+    var host = document.getElementById('txpd-content');
+    if (!force && nativeRoute === route && document.getElementById('txpd-route-view')) return;
+    nativeVersion++;
+    nativeRoute = route;
+    _nativeGuild = null;
+    document.querySelector('.search-guild').style.display = 'none';
+    var searchPlaceholder = document.querySelector('.search-content .place-holder');
+    if (searchPlaceholder) searchPlaceholder.style.display = document.getElementById('aside-search-input').value ? 'none' : '';
+    var old = document.getElementById('txpd-route-view');
+    if (old) old.remove();
+    var view = el('div', { id: 'txpd-route-view' });
+    host.prepend(view);
+    if (_pageOpen) { view.hidden = true; nativeRoute = ''; return; }
+    var guild = /^g\/([^/?]+)(?:\/(post|text)\/([^/?]+))?/.exec(route);
+    if (guild) nativeGuild(view, decodeURIComponent(guild[1]), guild[2] || '', decodeURIComponent(guild[3] || ''));
+    else if (route.split('?')[0] === 'index') {
+      view.appendChild(buildDynamicShell());
+      dynRender();
+      if (!_dyn.started) { _dyn.started = true; dynLoadMore(); }
+    } else nativeExplore(view, new URLSearchParams(route.split('?')[1] || '').get('keyword') || '');
+    syncPanelUi();
+  }
+  // Functions below share the existing editors, member actions, private messages and settings.
+  window.addEventListener('focus', refreshAccountUi);
+  window.addEventListener('resize', function () { ensureNarrowDrawer(); ensureMobileBackButton(); });
+  document.addEventListener('click', function (event) {
+    var anchor = event.target.closest && event.target.closest('a[href]');
+    if (!anchor || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || anchor.target === '_blank') return;
+    var url = new URL(anchor.href, location.href);
+    if (url.origin === location.origin && url.pathname.indexOf(PANEL_BASE) === 0) {
+      event.preventDefault();
+      spaNavigate(url.pathname.slice(PANEL_BASE.length) + url.search || 'explore');
+    }
+  });
+  var search = document.getElementById('aside-search-input');
+  var placeholder = document.querySelector('.search-content .place-holder');
+  var searchWrapper = document.querySelector('.search-wrapper');
+  searchWrapper.addEventListener('click', function () {
+    search.classList.add('aside-search-input--active');
+    searchWrapper.classList.add('active');
+    if (placeholder) placeholder.style.display = 'none';
+    search.focus();
+  });
+  search.addEventListener('blur', function () {
+    searchWrapper.classList.remove('active');
+    searchWrapper.classList.toggle('has-content', !!search.value);
+    search.classList.toggle('aside-search-input--active', !!search.value);
+    if (placeholder) placeholder.style.display = search.value ? 'none' : '';
+  });
+  search.addEventListener('input', function () { if (placeholder) placeholder.style.display = search.value ? 'none' : ''; });
+  search.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' && search.value.trim()) spaNavigate('search?keyword=' + encodeURIComponent(search.value.trim()) + (_nativeGuild ? '&guild=' + encodeURIComponent(_nativeGuild.guild_number) : ''));
+    if (event.key === 'Escape') search.blur();
+  });
+  document.querySelector('.aside-group--nav .group-header').addEventListener('click', function () {
+    var nav = document.querySelector('.app-menu-list');
+    nav.style.display = nav.style.display === 'none' ? '' : 'none';
+  });
+  var renderFromRouter = function () {
+    _pageOpen = ''; rememberPage();
+    closeEmbedOverlay();
+    renderNativeRoute(); syncPanelUi();
+    document.body.classList.remove('txpd-drawer-open');
+  };
+  PANEL_STARTUP.render = renderFromRouter;
+  PANEL_STARTUP.renderRoute = renderNativeRoute;
+  // Resolve synchronous rendering first. No fetch, module import, SDK or framework is awaited here.
+  renderNativeRoute();
+  mount();
+  syncPanelUi();
+  refreshAccountUi();
+  document.documentElement.dataset.txpdReady = 'true';
+  window.dispatchEvent(new CustomEvent('txpd:ready'));
+
 })();

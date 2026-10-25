@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Web 管理面板：pd.qq.com 官网同款界面（本地镜像）+ 完整管理 API。"""
+"""本地 Web 管理面板与 CLI API；沿用原版样式，不启动官方前端应用。"""
 
 import asyncio
 import base64
@@ -689,6 +689,7 @@ _PANEL_DIR = Path(__file__).resolve().parent / "panel"
 _ASSETS_DIR = _PANEL_DIR / "assets"
 
 _STATIC_TYPES = {
+    ".html": "text/html",
     ".css": "text/css",
     ".js": "application/javascript",
     ".mjs": "application/javascript",
@@ -1289,16 +1290,12 @@ def _make_static_handler(filename: str):
 
 
 async def _serve_panel_file(name: str) -> web.Response:
-    """提供 pd.qq.com 镜像静态资源（仅 assets 目录内已注册文件，防目录穿越）。"""
+    """提供本地面板资源；FileResponse 支持 ETag/304，刷新时无需重复下载。"""
     file = _ASSETS_DIR / Path(name).name
     if not file.is_file() or file.name.startswith("_"):
         return web.Response(status=404, text="not found")
     mime = _STATIC_TYPES.get(file.suffix.lower(), "application/octet-stream")
-    try:
-        body = await asyncio.to_thread(file.read_bytes)
-    except OSError:
-        return web.Response(status=404, text="not found")
-    return web.Response(body=body, content_type=mime, headers={"Cache-Control": "no-cache"})
+    return web.FileResponse(file, headers={"Content-Type": mime, "Cache-Control": "no-cache"})
 
 
 @register_route("POST", "/api/ext/tencent-channel/upload-image")
