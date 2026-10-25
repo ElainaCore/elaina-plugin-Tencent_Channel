@@ -7,74 +7,14 @@
   // 命中 qq 域的浏览器请求一律改写成本地 404，不触达 qq.com
   var BLOCKED_PATH = TXPD_API + '/__blocked';
 
-  // 这里在解析阶段就给 <html> 打标记，配合 CSS 第一帧就把它藏掉（回到探索页会自动解除）。
-  (function () {
-    try {
-      var p0 = window.location.pathname;
-      var base0 = '/api/ext/tencent-channel/panel/';
-      var tail0 = p0.indexOf(base0) === 0 ? p0.slice(base0.length) : p0.replace(/^\/+/, '');
-      tail0 = tail0.replace(/^\/+/, '').replace(/\/+$/, '');
-      if (tail0 && tail0 !== 'explore' && tail0.indexOf('index') !== 0) {
-        document.documentElement.className += ' txpd-deep-route';
-      }
-    } catch (e) { /* 忽略 */ }
-  })();
-
-  // 嵌入模式（帖子详情浮层里的 iframe）：不参与会话路径恢复，只渲染正文
-  var TXPD_EMBED = false;
-  try {
-    TXPD_EMBED = /[?&]txpd_embed=1/.test(window.location.search) && window.self !== window.top;
-    if (TXPD_EMBED) document.documentElement.className += ' txpd-embed';
-  } catch (e) { /* 顶层跨域访问失败 → 视为非嵌入 */ }
-
-  // 没有则回到 explore；深层路由（/g/xxx/post/yyy 整页加载）已在 base 下，保留原地址。
-  var _entryPath = '';   // 入口要恢复的深层路径（渲染出来之前一直盯着，见 syncSsrExploreVisibility）
+  // 首屏状态与路由在本地入口启动前就已确定；适配层不再与路由器抢入口。
+  var PANEL_STARTUP = window.TXPD_PANEL || {};
+  var TXPD_EMBED = !!PANEL_STARTUP.embed;
+  if (TXPD_EMBED) document.documentElement.classList.add('txpd-embed');
   function _tailOf(pathname) {
     var p = pathname.indexOf(PANEL_BASE) === 0 ? pathname.slice(PANEL_BASE.length) : pathname.replace(/^\/+/, '');
     return String(p).replace(/^\/+/, '').replace(/\/+$/, '');
   }
-  try {
-    var loc = window.location;
-    if (!TXPD_EMBED && loc.pathname.indexOf(PANEL_BASE) !== 0) {
-      var savedPath = null;
-      try { savedPath = window.sessionStorage.getItem('txpd_last_path'); } catch (e) { }
-      var targetPath = savedPath ? String(savedPath).replace(/^\/+/, '').replace(/\/+$/, '') : 'explore';
-      if (targetPath === 'explore' || !targetPath) {
-        window.history.replaceState(window.history.state, '', PANEL_BASE + 'explore');
-      } else {
-        // 原样带过去会被 vue-router 当成初始路由，于是地址又被拉回探索页。
-        _entryPath = targetPath;
-        try {
-          var pl = document.querySelector('script[data-nuxt-data="nuxt-app"]');
-          if (pl && pl.parentNode) pl.parentNode.removeChild(pl);
-        } catch (e2) { /* 忽略 */ }
-        try {
-          window.history.replaceState(null, '', PANEL_BASE + targetPath);
-        } catch (e2) { /* 极少数浏览器不允许改地址：保持原地址，交给应用自己决定 */ }
-        // 之后换 replaceState 不再堆历史条目），目标页渲染完成（探索页节点消失）才收工。
-        (function watchEntry(ticks) {
-          setTimeout(function () {
-            try {
-              if (!_entryPath) return;
-              var tail = _tailOf(window.location.pathname);
-              // 目标页出来了：地址对上且探索页节点已经不在了
-              if (tail === _entryPath && !document.getElementById('explorePage')) { _entryPath = ''; return; }
-              // 应用执意停在探索页（无权限之类）→ 放手，别一直挡着
-              if (ticks >= 8 && tail === 'explore' && document.getElementById('explorePage')) { _entryPath = ''; return; }
-              if (ticks >= 32) { _entryPath = ''; return; }   // 8s 还没成：交给应用
-              var target = PANEL_BASE + _entryPath;
-              if (tail !== _entryPath) {
-                if (ticks === 0) window.history.pushState(null, '', target);
-                else window.history.replaceState(null, '', target);
-              }
-              window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
-            } catch (e2) { /* 忽略 */ }
-            watchEntry(ticks + 1);
-          }, ticks === 0 ? 300 : 250);
-        })(0);
-      }
-    }
-  } catch (e) { /* replaceState 失败则退回原地址，不阻断 */ }
 
   // 都会连打这几条 console.error 刷屏。这里只压这几条已知噪音，其它报错照常输出。
   (function () {
@@ -130,21 +70,14 @@
     }
   } catch (e) { /* 忽略，不影响主流程 */ }
 
-  // 同步取一次槽位 Cookie（在应用 bundle 之前，保证首帧登录态判定就能读到）
+  // 启动器异步预取完成后才加载此脚本，不再使用阻塞主线程的同步 XHR。
   (function loadVirtualCookies() {
-    try {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', TXPD_API + '/panel-cookie', false);
-      xhr.send(null);
-      if (xhr.status === 200) {
-        var r = JSON.parse(xhr.responseText);
-        var c = (r && r.data && r.data.cookies) || {};
-        for (var k in c) VIRTUAL_COOKIES[k] = c[k];
-        TXPD_USER = (r && r.data && r.data.user) || '';
-        TXPD_WEB_LOGGED_IN = !!(r && r.data && r.data.session_valid);
-        // 「加载失败」。真实会话由面板里的「网页登录」提供，只影响显示；操作一律走 CLI。
-      }
-    } catch (e) { /* 未登录/网络失败时保持空，不阻断 */ }
+    var session = PANEL_STARTUP.session || {};
+    var cookies = session.cookies || {};
+    Object.keys(cookies).forEach(function (key) { VIRTUAL_COOKIES[key] = cookies[key]; });
+    TXPD_USER = session.user || '';
+    TXPD_WEB_LOGGED_IN = !!session.session_valid;
+    _cliLoggedIn = !!PANEL_STARTUP.anyAccount;
   })();
 
   // ---------- qq 域封锁：浏览器侧禁止任何到 *.qq.com 的请求 ----------
@@ -840,7 +773,8 @@
   document.head.appendChild(style);
 
   // ---------- 账号状态（缓存 10s）：决定登录按钮的形态 ----------
-  var _acctAny = null, _acctTs = 0;
+  var _acctAny = !!PANEL_STARTUP.anyAccount, _acctTs = Date.now();
+  setAcctState(_acctAny);
   // 那里先声明再赋值，避免 var 初始化顺序把 loadVirtualCookies 写入的值覆盖回 false
   function acctCacheKey() { return 'txpd_acct_state_v1_' + (TXPD_USER || 'default'); }
   function setAcctState(any) {
@@ -1797,26 +1731,11 @@
 
   // 点击已加入的频道 → 应用内路由进入频道视图（与「未加入的频道」卡片一致，不刷新页面）
   function spaNavigate(path) {
-    // pushState(null) + popstate：vue-router 视为手动地址变更，走应用内 replace（不整页刷新）
-    try {
-      var target = PANEL_BASE + path;
-      if (window.location.pathname === target) return true;
-      window.history.pushState(null, '', target);
-      window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
-      // target 整页加载（用户看到的「刷新一下」）；现在只在应用内重试，绝不重载文档。
-      (function retry(attempt) {
-        setTimeout(function () {
-          try {
-            if (attempt >= 3) return;
-            if (_tailOf(window.location.pathname) === _tailOf(path)) return;   // 已到位
-            window.history.replaceState(null, '', target);
-            window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
-          } catch (e) { /* 忽略 */ }
-          retry(attempt + 1);
-        }, 300);
-      })(0);
-      return true;
-    } catch (e) { return false; }
+    if (!PANEL_STARTUP.router) return false;
+    PANEL_STARTUP.router.push('/' + String(path).replace(/^\/+/, '')).catch(function (error) {
+      toast('页面跳转失败：' + String(error.message || error));
+    });
+    return true;
   }
   function openGuildView(g) {
     var num = (g && g.guild_number) || '';
@@ -2505,8 +2424,8 @@
 
   // 应用重渲染把节点挪走/删掉时只负责贴回去（重建会让元素身份变化，按钮点一半就失效）。
   var _pageViews = {};   // key -> 节点
-  var _pageOpen = '';    // 当前打开的页面 key（'' = 没有）
-  var _pagePath = '';    // 打开时的路由（路由变了自动收起）
+  var _pageOpen = PANEL_STARTUP.page || '';    // 当前打开的页面 key（'' = 没有）
+  var _pagePath = _pageOpen ? routeKey() : '';    // 打开时的路由（路由变了自动收起）
   var PAGE_BUILDERS = {};   // key -> build 函数（各自的 build 函数定义后填充）
   var _wlPollTimer = null;
   var _wlActive = false;   // 一条轮询链是否在跑（定时器等待中 + 请求中）
@@ -2517,18 +2436,27 @@
     _pageOpen = key;
     _pagePath = routeKey();
     ensurePageView();
+    rememberPage();
     try { markNavActive(); } catch (e) { /* 忽略 */ }
   }
   function closePage() {
     _pageOpen = '';
     ensurePageView();
+    rememberPage();
     try { markNavActive(); } catch (e) { /* 忽略 */ }
+  }
+  function rememberPage() {
+    try {
+      if (TXPD_EMBED) return;
+      window.sessionStorage.setItem('txpd_last_page', _pageOpen === 'dmSend' ? 'dm' : _pageOpen);
+      window.sessionStorage.setItem('txpd_last_page_path', window.location.pathname);
+    } catch (e) { /* 存储不可用时不影响当前操作 */ }
   }
   function openManagePage() { openPage('manage'); }
   function closeManagePage() { closePage(); }
   function ensurePageView() {
     // 用户点了别的导航/频道 → 自动收起（整页视图不跟随应用路由）
-    if (_pageOpen && _pagePath && routeKey() !== _pagePath) _pageOpen = '';
+    if (_pageOpen && _pagePath && routeKey() !== _pagePath) { _pageOpen = ''; rememberPage(); }
     var explore = document.getElementById('explorePage');
     var dyn = document.querySelector('.txpd-dynamic');
     var guildMain = document.querySelector('.game-guild-main');
@@ -2563,17 +2491,10 @@
     if (_wlPollTimer) { clearTimeout(_wlPollTimer); _wlPollTimer = null; }
     _wlActive = false;   // 链停了就把标记也清掉：否则状态行会被永久冻结在「等待扫码…」
   }
-  // 深路径时隐藏 SSR 的探索页（第一帧靠 head 里的标记 + CSS，这里负责后续切换）
+  // 保留选择器行为；入口已经没有探索页的 SSR 内容。
   function syncSsrExploreVisibility() {
-    try {
-      var tail = routeKey();
-      var deep = !!(tail && tail !== 'explore' && tail.indexOf('index') !== 0);
-      // 否则「先进频道、闪一眼探索页、再回到频道」——用户看到的就是「刷新一下」
-      if (!deep && _entryPath) deep = true;
-      var cls = document.documentElement.classList;
-      if (deep) cls.add('txpd-deep-route');
-      else cls.remove('txpd-deep-route');
-    } catch (e) { /* 忽略 */ }
+    var tail = routeKey();
+    document.documentElement.classList.toggle('txpd-deep-route', !!(tail && tail !== 'explore' && tail.indexOf('index') !== 0));
   }
 
   function routeKey() {
@@ -3002,20 +2923,6 @@
   PAGE_BUILDERS.schedule = buildSchedulePage;
   PAGE_BUILDERS.dm = buildDmPage;
   PAGE_BUILDERS.dmSend = buildDmSendPage;
-
-  // 没有 CLI 账号（未登录/无槽位）时自动打开插件管理，引导先登录
-  var _manageAutoTried = false;
-  function maybeAutoOpenManage() {
-    if (_manageAutoTried || _pageOpen) return;
-    api('/accounts').then(function (r) {
-      var accs = ((r && r.data && r.data.accounts) || []);
-      var anyIn = accs.some(function (a) { return a.logged_in; });
-      if (anyIn) { _manageAutoTried = true; return; }
-      _manageAutoTried = true;
-      openManagePage();
-      toast('还没有登录频道账号，先在这里完成登录');
-    }).catch(function () { /* 忽略 */ });
-  }
 
   // 官方 CSS 选择器带 data-v-5aaa2b70 作用域属性，挂上该属性即可原样继承官方外观与 hover/active
   function clockIcon(size) {
@@ -5539,16 +5446,7 @@
     } catch (e) { /* 忽略 */ }
   }
   var _uiSyncQueued = false;
-  function queueUiSync() {
-    if (_uiSyncQueued) return;
-    _uiSyncQueued = true;
-    setTimeout(function () {
-      _uiSyncQueued = false;
-      // 所以和 mount() 一样重排一次，等 body 就绪再同步。
-      if (!document.body) {
-        queueUiSync();
-        return;
-      }
+  function syncPanelUi() {
       ensureTopbarButtons();
       ensureNavEntries();
       syncPublishArea();
@@ -5563,6 +5461,19 @@
       ensureDynamicPage();
       ensurePageView();       // 放在动态页之后：整页视图要能盖住动态页
       ensureLoginNotice();    // 缺登录态的页面显示「无法查看」提示
+  }
+  PANEL_STARTUP.sync = syncPanelUi;
+  function queueUiSync() {
+    if (_uiSyncQueued) return;
+    _uiSyncQueued = true;
+    setTimeout(function () {
+      _uiSyncQueued = false;
+      // 所以和 mount() 一样重排一次，等 body 就绪再同步。
+      if (!document.body) {
+        queueUiSync();
+        return;
+      }
+      syncPanelUi();
     }, 120);
   }
   function mount() {
@@ -5572,7 +5483,7 @@
     queueUiSync();
     // 页面提示需要 CLI 登录态；顺带在没有任何已登录账号时打开插件管理引导登录
     getAccountsState().catch(function () { /* 忽略 */ });
-    setTimeout(maybeAutoOpenManage, 1200);
+    // 未登录时的管理页在启动状态中已选定，不再先显示探索页再延时跳转。
     // （document 层的监听收不到事件），同层后注册的监听仍可运行
     window.addEventListener('click', function (e) {
       var t = e.target, btn = null, anchor = null;
@@ -5807,9 +5718,6 @@
     for (var ai = 0; ai < oldAnchors.length; ai++) normalizeQqAnchor(oldAnchors[ai]);
     enforceImgPolicy(document);
   }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mount);
-  } else {
-    mount();
-  }
+  // 由启动器在组件树就绪后挂载，避免 DOMContentLoaded 早于异步组件。
+  PANEL_STARTUP.mount = mount;
 })();

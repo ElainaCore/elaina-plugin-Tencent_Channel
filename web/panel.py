@@ -1298,7 +1298,7 @@ async def _serve_panel_file(name: str) -> web.Response:
         body = await asyncio.to_thread(file.read_bytes)
     except OSError:
         return web.Response(status=404, text="not found")
-    return web.Response(body=body, content_type=mime)
+    return web.Response(body=body, content_type=mime, headers={"Cache-Control": "no-cache"})
 
 
 @register_route("POST", "/api/ext/tencent-channel/upload-image")
@@ -1334,12 +1334,12 @@ async def _serve_blocked(request: web.Request) -> web.Response:
 
 
 async def _serve_panel_index(request: web.Request) -> web.Response:
-    """SPA 导航兜底：baseURL 下的无后缀路径（如 /panel/explore）返回 index.html。"""
+    """所有面板导航返回同一客户端入口，不再按路由裁剪官方 SSR。"""
     tail = request.path[len("/api/ext/tencent-channel/panel/"):] if request.path.startswith("/api/ext/tencent-channel/panel/") else ""
     tail = tail.rstrip("/")
     # 含后缀（.xxx）的请求一律不兑底——未知静态文件必须 404，且防穿越（..%2f 解码后含 ..）
     last_seg = tail.rsplit("/", 1)[-1]
-    if ".." in tail or ("." in last_seg):
+    if ".." in tail or ("." in last_seg and tail != "index.html"):
         return web.Response(status=404, text="not found")
     file = _PANEL_DIR / "index.html"
     if not file.is_file():
@@ -1348,15 +1348,8 @@ async def _serve_panel_index(request: web.Request) -> web.Response:
         body = await asyncio.to_thread(file.read_bytes)
     except OSError:
         return web.Response(status=404, text="not found")
-    # 深层路由（/g/<频道号>/post/<帖子>、/g/<频道号> 等）整页加载时剥离 explore 的 SSR 数据载荷：
-    if tail and tail != "explore":
-        marker = b'<script type="application/json" data-nuxt-data="nuxt-app"'
-        start = body.find(marker)
-        if start != -1:
-            end = body.find(b"</script>", start)
-            if end != -1:
-                body = body[:start] + body[end + len(b"</script>"):]
-    return web.Response(body=body, content_type="text/html", charset="utf-8")
+    return web.Response(body=body, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-cache"})
 
 
 # ==================== 网页登录（扫码；只影响页面显示，不参与点赞/评论等操作） ====================
@@ -1636,7 +1629,8 @@ def _register_panel():
             register_route("GET", f"/api/ext/tencent-channel/panel/assets/assets/{f.name}", handler)
     # pd.qq.com 网关代理（前缀路由，透传页面本站 API 请求）
     register_route("*", "/api/ext/tencent-channel/pd/*", api_pd_proxy)
-    # SPA 路由兜底：Nuxt baseURL 指向 panel/，vue-router 会把地址 rewrite 为 /panel/<path>，
+    # 本地入口在路由器创建前恢复目标地址，所有深链接都从空组件树直接挂载。
+    register_route("GET", "/api/ext/tencent-channel/panel", _serve_panel_index)
     register_route("GET", "/api/ext/tencent-channel/panel/*", _serve_panel_index)
 
     # 被封锁请求的静默端点：注入脚本把 qq 域请求改写到此处，返回 204 避免控制台 404 噪音
