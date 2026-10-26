@@ -10,6 +10,7 @@ import time
 import base64
 import copy
 import json
+import hashlib
 import time as _time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -72,15 +73,7 @@ _PROXY_COOKIES_TS = 0.0
 
 
 def _read_user_cookie_file(user: str) -> str:
-    """读取指定槽位的 pd.qq.com Cookie（data/users/<槽位>/pd-cookie.txt 或全局 data/pd-cookie.txt）。"""
-    base = USERS_DIR / _safe_user_name(user)
-    for name in ("pd-cookie.txt", ".qqcli/pd-cookie.txt"):
-        f = base / name
-        try:
-            if f.is_file():
-                return f.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
+    """所有浏览只使用全局网页登录态，与 CLI 槽位无关。"""
     try:
         if COOKIE_FILE.is_file():
             return COOKIE_FILE.read_text(encoding="utf-8").strip()
@@ -94,12 +87,11 @@ def _proxy_cookie(user: str) -> str:
     now = time.time()
     if now - _PROXY_COOKIES_TS > 5 or user not in _PROXY_COOKIES:
         cookie = _read_user_cookie_file(user)
-        if cookie:
-            _PROXY_COOKIES[user] = {
-                part.split("=", 1)[0].strip(): part.split("=", 1)[1].strip()
-                for part in cookie.split(";")
-                if "=" in part
-            }
+        _PROXY_COOKIES[user] = {
+            part.split("=", 1)[0].strip(): part.split("=", 1)[1].strip()
+            for part in cookie.split(";")
+            if "=" in part
+        }
         _PROXY_COOKIES_TS = now
     return "; ".join(f"{k}={v}" for k, v in _PROXY_COOKIES.get(user, {}).items())
 
@@ -878,6 +870,55 @@ async def _json_body(request: web.Request) -> Dict[str, Any]:
 # ==================== 路由 ====================
 
 
+@register_route("GET", "/api/ext/tencent-channel/web/guilds")
+async def api_web_guilds(request: web.Request):
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.joined_guilds()
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    for guild in data["guilds"]:
+        _remember_ids(guild["guild_number"], guild["guild_id"])
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/profile")
+async def api_web_profile(request: web.Request):
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.profile()
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/recommendations")
+async def api_web_recommendations(request: web.Request):
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.rpc("trpc.group_pro.hot_recommend.HotRecommend/GetContentRecommend", {
+            "source": {"scene_id": 11, "bid": "PC"}, "cookies": str(request.query.get("cursor") or ""),
+            "direction": 1, "refresh_num": 0, "session_id": "", "busi_info": "", "visitor_msg": "",
+            "user_recommend_type": 0, "navigation_version": "",
+        }, 3, "0x90f4")
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
+@register_route("GET", "/api/ext/tencent-channel/web/search")
+async def api_web_search(request: web.Request):
+    keyword = str(request.query.get("keyword") or "").strip()
+    if not keyword:
+        return web.json_response({"success": False, "message": "缺少搜索关键词"})
+    reader = WebReader(_read_user_cookie_file(get_current_user()))
+    try:
+        data = await reader.search(keyword, str(request.query.get("cursor") or ""), str(request.query.get("guild_id") or ""))
+    except WebReadError as error:
+        return web.json_response({"success": False, "message": str(error)})
+    return web.json_response({"success": True, "data": data})
+
+
 @register_route("GET", "/api/ext/tencent-channel/web/guild")
 async def api_web_guild(request: web.Request):
     number = str(request.query.get("guild_number") or "").strip()
@@ -1457,11 +1498,8 @@ def _web_login_client() -> httpx.Client:
 
 
 def _cookie_header_of(client: httpx.Client) -> str:
-    parts: List[str] = []
-    for c in client.cookies.jar:
-        if c.value:
-            parts.append(f"{c.name}={c.value}")
-    return "; ".join(parts)
+    # ptlogin 跳转链可能包含其它域的同名 p_skey，仅保存 pd.qq.com 实际会收到的 Cookie。
+    return client.build_request("GET", UPSTREAM + "/").headers.get("cookie", "")
 
 
 def _parse_ptui_cb(text: str) -> List[str]:
@@ -1495,9 +1533,9 @@ def _slot_cookie_files() -> List[Path]:
     out: List[Path] = []
     try:
         for d in USERS_DIR.iterdir():
-            f = d / "pd-cookie.txt"
-            if f.is_file():
-                out.append(f)
+            for f in (d / "pd-cookie.txt", d / ".qqcli" / "pd-cookie.txt"):
+                if f.is_file():
+                    out.append(f)
     except OSError:
         pass
     return out
@@ -1662,6 +1700,7 @@ async def api_web_login_status(request: web.Request):
         "uin": uin.lstrip("o0") or uin,
         "nick": _WEB_LOGIN.get("nick") or "",
         "cookie_count": len(pairs),
+        "session_id": hashlib.sha256(cookie.encode()).hexdigest()[:16] if cookie else "guest",
         "polling": bool(_WEB_LOGIN.get("client") and _WEB_LOGIN.get("status") in ("waiting", "scanned")),
     }})
 
