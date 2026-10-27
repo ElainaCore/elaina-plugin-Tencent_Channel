@@ -3640,6 +3640,7 @@
   // 插件自己的评论弹窗，用 CLI 以当前槽位账号发表。页面原生可用（有 p_skey）时不拦截。
   function getFeedContext() {
     var fm = /\/post\/([^\/?#]+)/.exec(window.location.pathname);
+    var gm = /\/g\/([^\/?#]+)/.exec(window.location.pathname);
     var cm = /[?&]subc=([^&]+)/.exec(window.location.search);
     var av = document.querySelector('img[src*="groupprohead.gtimg.cn"]');
     var am = av ? /groupprohead\.gtimg\.cn\/(\d+)/.exec(av.getAttribute('src') || '') : null;
@@ -3647,6 +3648,7 @@
       feedId: fm ? decodeURIComponent(fm[1]) : '',
       channelId: cm ? cm[1] : '',
       guildId: am ? am[1] : '',
+      guildNumber: gm ? decodeURIComponent(gm[1]) : '',
     };
   }
 
@@ -4122,10 +4124,11 @@
   var _feedDetailInflight = {};
   function fetchFeedDetail(feedId, guildId, channelId) {
     feedId = String(feedId || '');
+    var routeGuildNumber = ((/\/g\/([^\/?#]+)/.exec(window.location.pathname) || [])[1] || '');
     var hit = _feedDetailCache[feedId];
     if (hit && Date.now() - hit.ts < 60000) return Promise.resolve(hit.payload);
     if (_feedDetailInflight[feedId]) return _feedDetailInflight[feedId];
-    var request = nativeWebRead('feed', { feed_id: feedId, guild_id: guildId || '', channel_id: channelId || '' }).then(function (data) {
+    var request = nativeWebRead('feed', { feed_id: feedId, guild_id: guildId || '', guild_number: routeGuildNumber, channel_id: channelId || '' }).then(function (data) {
       if (data.feed) data.feed.read_source = 'web';
       return { success: true, data: { data: data } };
     });
@@ -4291,7 +4294,7 @@
         clist.innerHTML = '';
         clist.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '评论加载中…'));
         // 以前没传这个参数，前端也没画 reply_list，所以「评论的评论」根本显示不出来。
-        nativeCommentRead('comments', { feed_id: feedId, guild_id: ctx.guildId, channel_id: ctx.channelId, count: '20', reply_list_num: '10' }, ctx).then(function (rc) {
+        nativeCommentRead('comments', { feed_id: feedId, guild_id: ctx.guildId, guild_number: ctx.guildNumber || '', channel_id: ctx.channelId, count: '20', reply_list_num: '10' }, ctx).then(function (rc) {
           var list = (rc.data && rc.data.data && rc.data.data.comments) || [];
           clist.innerHTML = '';
           if (!rc.success) { clist.appendChild(el('div', { 'class': 'txpd-cli-empty' }, '评论加载失败：' + String(rc.message || '').slice(0, 60))); return; }

@@ -953,10 +953,28 @@ async def api_web_feeds(request: web.Request):
 @register_route("GET", "/api/ext/tencent-channel/web/feed")
 async def api_web_feed(request: web.Request):
     guild_id = str(request.query.get("guild_id") or "").strip()
+    guild_number = str(request.query.get("guild_number") or "").strip()
     feed_id = str(request.query.get("feed_id") or "").strip()
-    if not guild_id or not feed_id:
-        return web.json_response({"success": False, "message": "缺少帖子 ID 或频道 ID"})
+    if not feed_id:
+        return web.json_response({"success": False, "message": "缺少帖子 ID"})
     reader = WebReader(_read_user_cookie_file(get_current_user()))
+    # 深链接详情页通常只有 /g/<频道号>/post/<帖子ID>，浏览器不会把
+    # 内部 guild_id 放进 URL。优先使用缓存，必要时通过网页接口解析频道号。
+    if not guild_number:
+        guild_number = _guild_num_from_referer(request.headers.get("Referer") or "")
+    if not guild_id and guild_number:
+        guild_id = _num_to_gid.get(guild_number, "")
+        if not guild_id and guild_number.isdecimal():
+            guild_id = guild_number
+        if not guild_id:
+            try:
+                guild = await reader.guild(guild_number)
+                guild_id = str(guild.get("guild_id") or "")
+                _remember_ids(guild_number, guild_id)
+            except WebReadError:
+                pass
+    if not guild_id:
+        return web.json_response({"success": False, "message": "缺少频道 ID，请从频道页重新打开帖子"})
     try:
         data = await reader.feed(feed_id, guild_id, str(request.query.get("channel_id") or ""))
     except WebReadError as error:
@@ -967,12 +985,28 @@ async def api_web_feed(request: web.Request):
 @register_route("GET", "/api/ext/tencent-channel/web/comments")
 async def api_web_comments(request: web.Request):
     guild_id = str(request.query.get("guild_id") or "").strip()
+    guild_number = str(request.query.get("guild_number") or "").strip()
     feed_id = str(request.query.get("feed_id") or "").strip()
     channel = str(request.query.get("channel_id") or "")
     cursor = str(request.query.get("attach_info") or "")
-    if not guild_id or not feed_id:
-        return web.json_response({"success": False, "message": "缺少帖子 ID 或频道 ID"})
     reader = WebReader(_read_user_cookie_file(get_current_user()))
+    if not feed_id:
+        return web.json_response({"success": False, "message": "缺少帖子 ID"})
+    if not guild_number:
+        guild_number = _guild_num_from_referer(request.headers.get("Referer") or "")
+    if not guild_id and guild_number:
+        guild_id = _num_to_gid.get(guild_number, "")
+        if not guild_id and guild_number.isdecimal():
+            guild_id = guild_number
+        if not guild_id:
+            try:
+                guild = await reader.guild(guild_number)
+                guild_id = str(guild.get("guild_id") or "")
+                _remember_ids(guild_number, guild_id)
+            except WebReadError:
+                pass
+    if not guild_id:
+        return web.json_response({"success": False, "message": "缺少频道 ID，请从频道页重新打开帖子"})
     try:
         if request.path.endswith("/replies"):
             comment_id = str(request.query.get("comment_id") or "").strip()
